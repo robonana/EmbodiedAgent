@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Editor / IDE
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated outputs
+arch_figure.pdf
+arch_figure.png
+*.egg-info/
+dist/
+build/
+
+# Runtime outputs (episode logs, captures, embeddings)
+outputs/
+runs/
+logs/
+*.faiss
+*.jsonl
+*.npy
+
+# OS
+.DS_Store
+Thumbs.db
