@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Render views of a ReplicaCAD object by orbiting the camera around it.
 Produces clean white-background, object-centred images for retrieval queries.

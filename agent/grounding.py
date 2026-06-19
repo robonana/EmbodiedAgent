@@ -4,6 +4,8 @@ Lazy-loaded on first call; degrades gracefully if transformers is unavailable.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 
@@ -23,7 +25,7 @@ class GroundingDINODetector:
         self._device_arg     = device
         self._processor      = None
         self._model          = None
-        self._device: str | None = None
+        self._device: Optional[str] = None
 
     def _load(self) -> None:
         if self._model is not None:

@@ -6,6 +6,7 @@ retrieve_memory_candidates   Search the FAISS index via EmbeddingWorker and
 """
 
 import os
+from typing import List, Optional
 
 
 def retrieve_memory_candidates(
@@ -14,11 +15,11 @@ def retrieve_memory_candidates(
     capture_out_dir: str,
     top_k: int = 5,
     model: str = "siglip_base",
-    retrieval_data_root: str | None = None,
-    scene_id: str | None = None,
+    retrieval_data_root: Optional[str] = None,
+    scene_id: Optional[str] = None,
     episodic_memory=None,
     embedding_worker=None,
-    query_image_paths: list[str] | None = None,
+    query_image_paths: Optional[List[str]] = None,
 ) -> list:
     """
     Search the FAISS index and return top-k MemoryCandidate objects.
@@ -52,7 +53,7 @@ def retrieve_memory_candidates(
     if not raw_frames:
         return []
 
-    from ..agent.schemas import MemoryCandidate
+    from agent.schemas import MemoryCandidate
 
     candidates = []
     for frame in raw_frames:

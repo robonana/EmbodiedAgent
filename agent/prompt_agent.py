@@ -137,17 +137,49 @@ class PromptEmbodiedAgent:
 
             # ── Collect labeled images for policy call ────────────────────────
             labeled_images: list[tuple[str, str]] = []
+            attached: set[str] = set()
             obs_path = self.toolbox._last_image_path
             if obs_path:
-                labeled_images.append((f"Current observation image ({obs_path}):",
-                                       obs_path))
+                labeled_images.append((
+                    f"Current head-camera observation (forward-facing) ({obs_path}):",
+                    obs_path))
+                attached.add(obs_path)
+            # Wrist/gripper camera (mounted on the arm, looks at the end-effector).
+            # Lets the policy see whether an object is actually grasped — the head
+            # camera never sees the gripper.
+            wrist_path = getattr(self.toolbox, "_last_wrist_image_path", None)
+            if wrist_path and os.path.exists(wrist_path):
+                labeled_images.append((
+                    f"Current wrist/gripper-camera view (shows the end-effector) "
+                    f"({wrist_path}):",
+                    wrist_path))
+                attached.add(wrist_path)
             if last_result and last_result.image_paths:
+                # Map each candidate image path → its memory_id so the policy sees
+                # that e.g. the file "000034.png" IS memory mem_000034 (the navigate
+                # target) — it never has to guess the correspondence or re-retrieve
+                # just to recover a memory_id for a frame it already identified.
+                path_to_mem: dict[str, str] = {}
+                for c in (last_result.data or {}).get("candidates", []):
+                    cp, mid = c.get("rgb_path"), c.get("memory_id")
+                    if cp and mid:
+                        path_to_mem[cp] = mid
                 for i, p in enumerate(last_result.image_paths):
-                    if p != obs_path and os.path.exists(p):
-                        labeled_images.append((
-                            f"Last tool result image {i + 1} ({os.path.basename(p)}):",
-                            p,
-                        ))
+                    if p not in attached and os.path.exists(p):
+                        mem_id = path_to_mem.get(p)
+                        if mem_id:
+                            label = (
+                                f"Last tool result image {i + 1} "
+                                f"(file {os.path.basename(p)} = memory_id {mem_id}; "
+                                f'navigate here with target={{"memory_id":"{mem_id}"}}):'
+                            )
+                        else:
+                            label = (
+                                f"Last tool result image {i + 1} "
+                                f"({os.path.basename(p)}):"
+                            )
+                        labeled_images.append((label, p))
+                        attached.add(p)
 
             # ── Call Gemini policy ────────────────────────────────────────────
             print(f"  [Gemini] calling policy (images={len(labeled_images)})")
@@ -156,6 +188,9 @@ class PromptEmbodiedAgent:
                 user_prompt=user_prompt,
                 labeled_images=labeled_images,
             )
+            # Signal renderer to pause before executing this decision
+            if hasattr(self.toolbox, "vlm_just_decided"):
+                self.toolbox.vlm_just_decided = True
 
             # ── Parse action ─────────────────────────────────────────────────
             if not raw_response_dict or "tool" not in raw_response_dict:
@@ -165,6 +200,10 @@ class PromptEmbodiedAgent:
                     rationale="Gemini returned no valid JSON; waiting one step.",
                     tool="wait",
                     arguments={"seconds": 1},
+                    previous_action_verification=(
+                        "Previous action verification: unable to verify because "
+                        "the VLM response was not valid JSON."
+                    ),
                 )
             else:
                 action = ToolAction.from_dict(raw_response_dict)
@@ -176,8 +215,12 @@ class PromptEmbodiedAgent:
                     rationale=f"Tool '{action.tool}' is invalid; waiting one step.",
                     tool="wait",
                     arguments={"seconds": 1},
+                    previous_action_verification=action.previous_action_verification,
                 )
 
+            if action.previous_action_verification:
+                print(f"  previous_action_verification: "
+                      f"{action.previous_action_verification}")
             if action.progress_analysis:
                 print(f"  progress_analysis: {action.progress_analysis}")
             print(f"  rationale={action.rationale!r}\n"
@@ -230,6 +273,9 @@ class PromptEmbodiedAgent:
             # ── Append to trajectory log (JSONL only — not used in prompt) ────
             trajectory.append({
                 "step_idx":         step_idx + 1,
+                "previous_action_verification": (
+                    action.previous_action_verification or ""
+                ),
                 "progress_analysis": action.progress_analysis or "",
                 "rationale":        action.rationale or "",
                 "expected_progress": action.expected_progress or "",

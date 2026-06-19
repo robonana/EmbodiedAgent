@@ -12,6 +12,7 @@ NOT appear in any MemoryEntry field.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -20,10 +21,60 @@ from typing import Any, Optional
 
 VALID_TOOLS: frozenset[str] = frozenset({
     "detect", "inspect", "retrieve_memory", "retrieve_trajectory",
-    "navigate", "approach", "manipulate", "verify", "wait", "finish",
+    "navigate", "base_move", "manipulate", "wait", "finish",
 })
 
 SUPPORTED_SKILLS: frozenset[str] = frozenset({"grasp", "place", "drop"})
+
+BASE_MOVE_MOTIONS: frozenset[str] = frozenset({
+    "forward",
+    "backward",
+    "left",
+    "right",
+    "rotate 30 degrees",
+    "rotate -30 degrees",
+})
+
+_BASE_MOVE_ALIASES: dict[str, str] = {
+    "forward": "forward",
+    "backward": "backward",
+    "back": "backward",
+    "left": "left",
+    "right": "right",
+    "rotate 30 degrees": "rotate 30 degrees",
+    "rotate +30 degrees": "rotate 30 degrees",
+    "rotate 30": "rotate 30 degrees",
+    "rotate +30": "rotate 30 degrees",
+    "rotate_30": "rotate 30 degrees",
+    "rotate_30_degrees": "rotate 30 degrees",
+    "turn left": "rotate 30 degrees",
+    "rotate -30 degrees": "rotate -30 degrees",
+    "rotate -30": "rotate -30 degrees",
+    "rotate_-30": "rotate -30 degrees",
+    "rotate_-30_degrees": "rotate -30 degrees",
+    "turn right": "rotate -30 degrees",
+}
+
+
+def normalize_base_move_motion(motion: object) -> Optional[str]:
+    key = str(motion or "").strip().lower().replace("_", " ")
+    key = " ".join(key.split())
+    return _BASE_MOVE_ALIASES.get(key)
+
+
+def normalize_memory_id(memory_id: object) -> Optional[str]:
+    """Normalize memory ids such as mem42 / mem_000042 to mem_000042."""
+    if not isinstance(memory_id, str):
+        return None
+    raw = memory_id.strip()
+    if not raw:
+        return None
+    numeric = re.fullmatch(r"mem[_-]?(\d+)", raw, flags=re.IGNORECASE)
+    if numeric:
+        return f"mem_{int(numeric.group(1)):06d}"
+    if raw.lower().startswith("mem_"):
+        return raw
+    return None
 
 
 
@@ -37,6 +88,7 @@ class ToolAction:
     arguments: dict[str, Any]
     rationale: str = ""
     expected_progress: Optional[str] = None
+    previous_action_verification: Optional[str] = None
     progress_analysis: Optional[str] = None  # agent's self-assessment of task progress
 
     @classmethod
@@ -46,11 +98,19 @@ class ToolAction:
             arguments=d.get("arguments", {}),
             rationale=str(d.get("rationale", "")),
             expected_progress=d.get("expected_progress"),
+            previous_action_verification=d.get("previous_action_verification"),
             progress_analysis=d.get("progress_analysis"),
         )
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "previous_action_verification": self.previous_action_verification,
+            "progress_analysis": self.progress_analysis,
+            "rationale": self.rationale,
+            "tool": self.tool,
+            "arguments": self.arguments,
+            "expected_progress": self.expected_progress,
+        }
 
 
 @dataclass

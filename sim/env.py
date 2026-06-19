@@ -146,4 +146,3 @@ def find_objects(scene_builder, query: str) -> list[tuple[str, object]]:
     return [(k, v) for k, v in scene_builder.scene_objects.items()
             if q in k.lower()]
 
-

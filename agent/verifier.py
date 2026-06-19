@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .schemas import VALID_TOOLS, SUPPORTED_SKILLS
+from .schemas import (
+    BASE_MOVE_MOTIONS,
+    SUPPORTED_SKILLS,
+    VALID_TOOLS,
+    normalize_base_move_motion,
+    normalize_memory_id,
+)
 
 
 # ── JSON / action validation ──────────────────────────────────────────────────
@@ -38,7 +44,10 @@ def check_tool_argument_validity(
         return False, "invalid_tool"
 
     if tool == "inspect":
-        if not arguments.get("image_path"):
+        image_paths = arguments.get("image_paths")
+        if not arguments.get("image_path") and not (
+            isinstance(image_paths, (list, tuple)) and len(image_paths) > 0
+        ):
             return False, "invalid_arguments"
         if not arguments.get("question"):
             return False, "invalid_arguments"
@@ -73,14 +82,23 @@ def check_tool_argument_validity(
             return False, "invalid_arguments"
 
     elif tool == "navigate":
+        # navigate only accepts a memory_id (a retrieve_memory candidate);
+        # raw coordinate/pose goals are not allowed.
         tgt = arguments.get("target")
-        if not isinstance(tgt, dict):
-            return False, "invalid_arguments"
-        if not tgt.get("pose"):
+        if isinstance(tgt, str):
+            if normalize_memory_id(tgt) is None:
+                return False, "invalid_arguments"
+        elif isinstance(tgt, dict):
+            has_memory_id = normalize_memory_id(
+                tgt.get("memory_id") or tgt.get("mem_id") or tgt.get("memory")
+            ) is not None
+            if not has_memory_id:
+                return False, "invalid_arguments"
+        else:
             return False, "invalid_arguments"
 
-    elif tool == "approach":
-        if not arguments.get("target"):
+    elif tool == "base_move":
+        if normalize_base_move_motion(arguments.get("motion")) not in BASE_MOVE_MOTIONS:
             return False, "invalid_arguments"
 
     elif tool == "manipulate":
@@ -89,10 +107,6 @@ def check_tool_argument_validity(
         if arguments["skill"] not in SUPPORTED_SKILLS:
             return False, "unsupported_skill"
         if not arguments.get("target"):
-            return False, "invalid_arguments"
-
-    elif tool == "verify":
-        if not arguments.get("condition"):
             return False, "invalid_arguments"
 
     return True, None
@@ -121,19 +135,13 @@ def infer_progress_from_tool_result(
             return float(dist) < 2.0
         return result_ok
 
-    if tool == "approach":
-        return result_data.get("reached_desired_distance", False)
+    if tool == "base_move":
+        return bool(result_data.get("completed", False))
 
     if tool == "manipulate":
         skill = result_data.get("skill", "")
         if skill == "grasp":
-            return None  # agent must call verify() to confirm grasp success
+            return None  # next policy response must verify grasp success from observation
         return result_ok
 
-    if tool == "verify":
-        satisfied = result_data.get("satisfied")
-        return satisfied if satisfied is not None else None
-
     return None
-
-

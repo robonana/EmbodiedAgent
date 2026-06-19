@@ -2,15 +2,16 @@
 agent/toolbox_base.py — BaseToolbox: backend-independent agent toolbox.
 
 Contains all tool logic and state management.  Backend-specific behaviour is
-delegated to ten abstract primitive methods that each backend must implement:
+delegated to abstract primitive methods that each backend must implement:
 
     _step()                        → dict          advance one control cycle; return obs dict
     _capture_rgb(obs)              → ndarray|None  extract RGB from obs
     _get_robot_pose()              → [x, y, yaw]   current robot pose
     _navigate_step(bearing)        → None          send one navigation command toward bearing
+    _base_move_step(motion)        → None          send one discrete base motion tick
     _plan_path(start, goal)        → [ndarray]     list of XY waypoints
-    _grasp(target)                 → (ok, name, dist)
-    _release()                     → None
+    _grasp(target)                 → (localized, name, dist)  # localized=attempted, not succeeded
+    _release(...)                  → (ok, summary)
     _forward_step()                → None          send one forward movement command
     _get_depth_and_intrinsics(obs) → (depth, K, E) | None
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -26,10 +28,13 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from .schemas import (
+    BASE_MOVE_MOTIONS,
     ToolAction,
     ToolResult,
     SUPPORTED_SKILLS,
     VALID_TOOLS,
+    normalize_base_move_motion,
+    normalize_memory_id,
 )
 from .verifier import check_tool_argument_validity
 
@@ -72,12 +77,14 @@ class BaseToolbox(ABC):
     """
     Backend-independent implementation of all agent tools.
 
-    Concrete subclasses implement the ten primitive methods below for either
+    Concrete subclasses implement the primitive methods below for either
     a simulator or a real robot.
     """
 
     _NAV_MAX_STEPS  = 2000
-    _APPROACH_STEPS = 600
+    _BASE_MOVE_MAX_STEPS = 120
+    _BASE_MOVE_DISTANCE_M = 0.30
+    _BASE_MOVE_ROTATION_RAD = math.radians(30)
     _EVENT_EVERY    = 10
 
     def __init__(
@@ -107,6 +114,11 @@ class BaseToolbox(ABC):
         self._last_obs:        Optional[dict]       = None
         self._last_rgb:        Optional[np.ndarray] = None
         self._last_image_path: Optional[str]        = None
+        # Wrist / gripper camera (looks at the end-effector). Lets the VLM judge
+        # whether an object is actually grasped — the forward head camera cannot
+        # see the gripper. None on backends without a wrist camera.
+        self._last_wrist_rgb:        Optional[np.ndarray] = None
+        self._last_wrist_image_path: Optional[str]        = None
         self._step_counter:    int                  = 0
 
         for sub in ("images", "crops"):
@@ -126,6 +138,14 @@ class BaseToolbox(ABC):
     def _capture_rgb(self, obs: dict) -> Optional[np.ndarray]:
         """Extract RGB ndarray (H,W,3 uint8) from obs, or None."""
 
+    def _capture_wrist_rgb(self, obs: dict) -> Optional[np.ndarray]:
+        """Extract wrist/gripper-camera RGB (H,W,3 uint8) from obs, or None.
+
+        Default: no wrist camera. Backends with an arm-mounted camera override
+        this so observe() can attach a gripper view to the VLM observation.
+        """
+        return None
+
     @abstractmethod
     def _get_robot_pose(self) -> list[float]:
         """Return current robot pose as [x, y, yaw]."""
@@ -135,6 +155,10 @@ class BaseToolbox(ABC):
         """Advance robot one kinematic step toward bearing (radians)."""
 
     @abstractmethod
+    def _base_move_step(self, motion: str) -> None:
+        """Advance the robot one small base-motion tick."""
+
+    @abstractmethod
     def _plan_path(
         self, start_xy: np.ndarray, goal_xy: np.ndarray
     ) -> list[np.ndarray]:
@@ -142,16 +166,24 @@ class BaseToolbox(ABC):
 
     @abstractmethod
     def _grasp(self, target: str) -> tuple[bool, str, float]:
-        """Attempt to grasp nearest object matching target.
-        Returns (success, object_name, distance_m)."""
+        """Attempt to grasp the object the target pixel lands on.
+        Returns (localized, object_name, distance_m), where `localized` means a
+        graspable object was found and a grasp was ATTEMPTED — not that the
+        grasp succeeded. Whether the object is actually held is left to the
+        verify step; the tool must not decide task success here."""
 
     @abstractmethod
-    def _release(self) -> None:
-        """Release held object."""
+    def _release(
+        self,
+        target: str = "",
+        destination: Optional[str] = None,
+        target_region: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Release held object. Returns (success, short_summary)."""
 
     @abstractmethod
     def _forward_step(self) -> None:
-        """Move robot forward one small step (blind approach fallback)."""
+        """Move robot forward one small step."""
 
     @abstractmethod
     def _get_depth_and_intrinsics(
@@ -181,9 +213,8 @@ class BaseToolbox(ABC):
                 "retrieve_memory":     self.retrieve_memory,
                 "retrieve_trajectory": self.retrieve_trajectory,
                 "navigate":            self.navigate,
-                "approach":            self.approach,
+                "base_move":           self.base_move,
                 "manipulate":          self.manipulate,
-                "verify":              self.verify,
                 "wait":                self.wait,
                 "finish":              self.finish,
             }
@@ -210,17 +241,82 @@ class BaseToolbox(ABC):
             self._last_rgb        = rgb
             self._last_image_path = img_path
 
+            # Wrist / gripper camera (if the backend exposes one). Saved with the
+            # SAME step counter as the head frame so the pair is easy to align.
+            wrist_rgb  = self._capture_wrist_rgb(obs)
+            wrist_path = None
+            if wrist_rgb is not None:
+                wrist_path = self._save_companion_frame(wrist_rgb, "wrist")
+            self._last_wrist_rgb        = wrist_rgb
+            self._last_wrist_image_path = wrist_path
+
             pose    = self._get_robot_pose()
             summary = f"Camera captured. pose={self._pose_str(pose)}"
+            if wrist_path:
+                summary += " (+ wrist view)"
+            image_paths = [img_path] + ([wrist_path] if wrist_path else [])
             return ToolResult(
                 ok=True, tool="observe", summary=summary,
-                data={"robot_pose": pose, "image_path": img_path},
+                data={"robot_pose": pose, "image_path": img_path,
+                      "wrist_image_path": wrist_path},
+                image_paths=image_paths,
             )
         except Exception as e:
             return ToolResult(ok=False, tool="observe",
                               summary=f"observe failed: {e}")
 
     # ── inspect ───────────────────────────────────────────────────────────────
+
+    def _save_detection_overlay(
+        self,
+        image_path: str,
+        image: np.ndarray,
+        query: str,
+        detections: list[dict],
+    ) -> Optional[str]:
+        """Save an annotated copy of a detect() image with bbox overlays."""
+        if not detections:
+            return None
+        try:
+            from PIL import Image as PILImage, ImageDraw
+
+            img = PILImage.fromarray(image.astype(np.uint8)).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            W, H = img.size
+            for i, det in enumerate(detections, 1):
+                bbox = det.get("bbox", [])
+                if len(bbox) < 4:
+                    continue
+                x1, y1, x2, y2 = [int(round(float(v))) for v in bbox[:4]]
+                x1 = max(0, min(W - 1, x1))
+                y1 = max(0, min(H - 1, y1))
+                x2 = max(x1 + 1, min(W, x2))
+                y2 = max(y1 + 1, min(H, y2))
+                color = (255, 50, 50)
+                draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
+                label = str(det.get("label") or query)
+                score = det.get("score")
+                suffix = f" {score:.2f}" if isinstance(score, (int, float)) else ""
+                text = f"{i}: {label}{suffix}"
+                text_bbox = draw.textbbox((x1, y1), text)
+                text_h = text_bbox[3] - text_bbox[1]
+                ty = max(0, y1 - text_h - 6)
+                draw.rectangle(
+                    (x1, ty, min(W, x1 + text_bbox[2] - text_bbox[0] + 8),
+                     min(H, ty + text_h + 6)),
+                    fill=(0, 0, 0),
+                )
+                draw.text((x1 + 4, ty + 3), text, fill=(255, 255, 255))
+
+            src = Path(image_path)
+            safe_query = re.sub(r"[^A-Za-z0-9_.-]+", "_", query.strip()).strip("_")
+            safe_query = safe_query[:48] or "query"
+            out_path = src.with_name(f"{src.stem}_detect_{safe_query}{src.suffix}")
+            img.save(out_path)
+            return str(out_path)
+        except Exception as exc:
+            print(f"[detect] bbox overlay save failed: {exc}", flush=True)
+            return None
 
     def detect(self, image_path: str, query: str, **_) -> ToolResult:
         """GroundingDINO open-set bounding box proposals."""
@@ -242,27 +338,45 @@ class BaseToolbox(ABC):
             return ToolResult(ok=False, tool="detect",
                               summary=f"No detections for '{query}'.",
                               data={"query": query, "detections": []})
+        overlay_path = self._save_detection_overlay(
+            image_path, img, query, detections
+        )
+        image_paths = [image_path] + ([overlay_path] if overlay_path else [])
         return ToolResult(
             ok=True, tool="detect",
-            summary=f"Found {len(detections)} detection(s) for '{query}'.",
+            summary=(f"Found {len(detections)} detection(s) for '{query}'."
+                     + (f" Saved bbox overlay: {overlay_path}"
+                        if overlay_path else "")),
             data={"query": query, "detections": detections,
-                  "bboxes": [d["bbox"] for d in detections]},
-            image_paths=[image_path],
+                  "bboxes": [d["bbox"] for d in detections],
+                  "annotated_image_path": overlay_path},
+            image_paths=image_paths,
         )
 
     def inspect(
         self,
-        image_path: str,
+        image_path: Optional[str] = None,
         question: str = "What do you see?",
         bbox: Optional[list] = None,
+        image_paths: Optional[list] = None,
         **_,
     ) -> ToolResult:
-        if not image_path or not os.path.exists(image_path):
+        # Accept a single image (image_path) or several (image_paths). They are
+        # all sent to the VLM together so it can compare/reason across views.
+        raw_paths: list[str] = []
+        if image_paths:
+            raw_paths = [p for p in image_paths if p]
+        elif image_path:
+            raw_paths = [image_path]
+        paths = [p for p in raw_paths if os.path.exists(p)]
+        if not paths:
             return ToolResult(ok=False, tool="inspect",
                               summary="Image not available.")
 
+        # bbox cropping is only meaningful for a single image; with multiple
+        # images each is inspected in full and bbox is ignored.
         bboxes_raw: list[list] = []
-        if bbox is not None:
+        if bbox is not None and len(paths) == 1:
             if isinstance(bbox[0], (int, float)):
                 bboxes_raw = [bbox]
             else:
@@ -273,12 +387,16 @@ class BaseToolbox(ABC):
         crop_infos:   list[list] = []
 
         if not bboxes_raw:
-            query_paths  = [image_path]
-            query_labels = [f"Full image ({image_path}):"]
+            for i, p in enumerate(paths):
+                query_paths.append(p)
+                query_labels.append(
+                    f"Full image ({p}):" if len(paths) == 1
+                    else f"Image {i + 1} of {len(paths)} ({p}):")
         else:
             from PIL import Image as _PIL
             crops_dir = str(self.log_dir / "crops")
-            img       = _PIL.open(image_path).convert("RGB")
+            single    = paths[0]
+            img       = _PIL.open(single).convert("RGB")
             W, H      = img.size
             for i, raw_box in enumerate(bboxes_raw):
                 x1, y1, x2, y2 = [int(v) for v in raw_box[:4]]
@@ -299,7 +417,7 @@ class BaseToolbox(ABC):
                     query_paths.append(crop_path)
                     query_labels.append(
                         f"Crop {i+1} of {len(bboxes_raw)} "
-                        f"(bbox=[{x1},{y1},{x2},{y2}] from {image_path}):")
+                        f"(bbox=[{x1},{y1},{x2},{y2}] from {single}):")
                     crop_infos.append([x1, y1, x2, y2])
                 except Exception as e:
                     return ToolResult(ok=False, tool="inspect",
@@ -319,9 +437,10 @@ class BaseToolbox(ABC):
         cand_bboxes = result.get("candidate_bboxes", [])
         label       = f"{crop_infos}" if crop_infos else "full"
 
+        srcs = ", ".join(paths)
         return ToolResult(
             ok=True, tool="inspect",
-            summary=f"inspect {image_path} [{label}] | {question} | {answer}",
+            summary=f"inspect {srcs} [{label}] | {question} | {answer}",
             data={"question": question, "answer": answer, "evidence": evidence,
                   "confidence": confidence, "candidate_bboxes": cand_bboxes,
                   "bboxes": crop_infos or None},
@@ -338,7 +457,7 @@ class BaseToolbox(ABC):
         time_to: Optional[str] = None,
         **_,
     ) -> ToolResult:
-        from ..memory.retrieval import retrieve_memory_candidates
+        from memory.retrieval import retrieve_memory_candidates
 
         top_k    = -1 if int(top_k) == -1 else max(1, int(top_k))
         index_dir = os.path.join(
@@ -420,6 +539,7 @@ class BaseToolbox(ABC):
             analysis = analysis_by_id.get(c.memory_id, {})
             entry: dict = {
                 "memory_id":       c.memory_id,
+                "navigate_target": {"memory_id": c.memory_id},
                 "rgb_path":        c.image_path,
                 "robot_pose":      c.robot_pose,
                 "retrieval_score": round(c.retrieval_score, 4),
@@ -483,9 +603,11 @@ class BaseToolbox(ABC):
                         "timestamp":         entry.get("timestamp"),
                         "tool":              action.get("tool"),
                         "arguments":         action.get("arguments"),
-                        "progress_analysis": action.get("progress_analysis", "")[:200],
+                        "previous_action_verification": action.get(
+                            "previous_action_verification", ""),
+                        "progress_analysis": action.get("progress_analysis", ""),
                         "ok":                result.get("ok"),
-                        "summary":           result.get("summary", "")[:150],
+                        "summary":           result.get("summary", ""),
                         "robot_pose":        obs.get("robot_pose"),
                     })
         except Exception as e:
@@ -575,98 +697,87 @@ class BaseToolbox(ABC):
             image_paths=obs_result.image_paths,
         )
 
-    # ── approach ─────────────────────────────────────────────────────────────
+    # ── base_move ────────────────────────────────────────────────────────────
 
-    def approach(
+    def base_move(
         self,
-        target: str = "view_center",
-        desired_distance: float = 0.55,
+        motion: str,
         **_,
     ) -> ToolResult:
-        desired_distance = float(desired_distance)
+        motion = normalize_base_move_motion(motion) or ""
+        if motion not in BASE_MOVE_MOTIONS:
+            return ToolResult(
+                ok=False, tool="base_move",
+                summary=(f"base_move: invalid motion {motion!r}. "
+                         f"Allowed: {sorted(BASE_MOVE_MOTIONS)}"),
+            )
 
-        obj_xy: Optional[np.ndarray] = None
-        if target != "view_center":
-            obj_xy = self._estimate_object_xy_from_depth(target)
-            if obj_xy is None:
-                print(f"[Toolbox] approach: depth estimation failed for "
-                      f"'{target}', falling back to forward steps")
-                return self._forward_approach(desired_distance, target)
+        start_pose = self._get_robot_pose()
+        start_xy = np.array(start_pose[:2], dtype=np.float64)
+        start_yaw = float(start_pose[2]) if len(start_pose) >= 3 else 0.0
+        rotate = motion.startswith("rotate")
+        target = (self._BASE_MOVE_ROTATION_RAD if rotate
+                  else self._BASE_MOVE_DISTANCE_M)
+        steps = 0
 
-        start_xy = np.array(self._get_robot_pose()[:2])
-
-        dir_vec = start_xy - obj_xy
-        d = float(np.linalg.norm(dir_vec))
-        dir_vec = dir_vec / d if d > 1e-6 else np.array([1.0, 0.0])
-        approach_xy = obj_xy + desired_distance * dir_vec
-        approach_xy = self._snap_to_navmesh(approach_xy)
-
-        waypoints = self._plan_path(start_xy, approach_xy)
-        WP_ADV = 0.15
-        wp_idx = 0
-        reached = False
-
-        for step in range(self._APPROACH_STEPS):
+        for step in range(self._BASE_MOVE_MAX_STEPS):
             if step % self._EVENT_EVERY == 0:
                 self._pump_events()
 
-            pose     = self._get_robot_pose()
-            curr_xy  = np.array(pose[:2])
-            dist_obj = float(np.linalg.norm(obj_xy - curr_xy))
-
-            if dist_obj <= desired_distance:
-                reached = True
-                break
-
-            if (wp_idx == len(waypoints) - 1 and
-                    np.linalg.norm(waypoints[-1] - curr_xy) < WP_ADV):
-                break
-
-            while wp_idx < len(waypoints) - 1:
-                if np.linalg.norm(waypoints[wp_idx] - curr_xy) < WP_ADV:
-                    wp_idx += 1
-                else:
-                    break
-
-            curr_yaw = pose[2]
-            delta    = waypoints[wp_idx] - curr_xy
-            bearing  = math.atan2(delta[1], delta[0]) - curr_yaw
-            bearing  = (bearing + math.pi) % (2 * math.pi) - math.pi
-
-            self._navigate_step(bearing)
+            self._base_move_step(motion)
             self._last_obs = self._step()
+            steps += 1
 
+            pose = self._get_robot_pose()
+            curr_xy = np.array(pose[:2], dtype=np.float64)
+            curr_yaw = float(pose[2]) if len(pose) >= 3 else start_yaw
+            if rotate:
+                yaw_delta = self._angle_diff(curr_yaw, start_yaw)
+                if motion == "rotate 30 degrees":
+                    progress = yaw_delta
+                else:
+                    progress = -yaw_delta
+            else:
+                progress = float(np.linalg.norm(curr_xy - start_xy))
 
-        # Nav stopped at navmesh boundary; close remaining gap with forward steps
-        final_xy   = np.array(self._get_robot_pose()[:2])
-        final_dist = float(np.linalg.norm(obj_xy - final_xy))
-        if not reached and final_dist > desired_distance:
-            gap        = final_dist - desired_distance
-            extra_steps = max(1, int(gap / 0.015))
-            target_yaw  = math.atan2(obj_xy[1] - final_xy[1], obj_xy[0] - final_xy[0])
-            self._align_yaw(target_yaw)
-            for _ in range(extra_steps):
-                curr_xy = np.array(self._get_robot_pose()[:2])
-                if float(np.linalg.norm(obj_xy - curr_xy)) <= desired_distance:
-                    break
-                self._forward_step()
-                self._last_obs = self._step()
+            if progress >= target * 0.95:
+                break
 
-        final_xy   = np.array(self._get_robot_pose()[:2])
-        final_dist = float(np.linalg.norm(obj_xy - final_xy))
-        reached    = reached or final_dist <= desired_distance + 0.1
+        final_pose = self._get_robot_pose()
+        final_xy = np.array(final_pose[:2], dtype=np.float64)
+        final_yaw = float(final_pose[2]) if len(final_pose) >= 3 else start_yaw
+        yaw_delta = self._angle_diff(final_yaw, start_yaw)
+        distance = float(np.linalg.norm(final_xy - start_xy))
+        if rotate:
+            progress = yaw_delta if motion == "rotate 30 degrees" else -yaw_delta
+            completed = progress >= target * 0.75
+        else:
+            progress = distance
+            completed = progress >= target * 0.5
+
         obs_result = self.observe()
-
         return ToolResult(
-            ok=reached, tool="approach",
-            summary=(f"approach['{target[:40]}']: "
-                     f"final_dist={final_dist:.2f}m  reached={reached}"),
-            data={"target": target, "desired_distance": desired_distance,
-                  "final_distance": final_dist, "reached_desired_distance": reached},
+            ok=completed, tool="base_move",
+            summary=(f"base_move[{motion}]: steps={steps} "
+                     f"distance={distance:.2f}m yaw_delta={math.degrees(yaw_delta):.1f}deg "
+                     f"completed={completed}"),
+            data={
+                "motion": motion,
+                "steps": steps,
+                "start_pose": start_pose,
+                "final_pose": final_pose,
+                "distance_m": distance,
+                "yaw_delta_deg": math.degrees(yaw_delta),
+                "completed": completed,
+            },
             image_paths=obs_result.image_paths,
         )
 
     # ── manipulate ───────────────────────────────────────────────────────────
+
+    def _post_manipulate(self) -> None:
+        """Hook run after every grasp/place attempt, whatever the outcome.
+        Backends with an arm override this to retract it; default is a no-op."""
 
     def manipulate(
         self,
@@ -686,61 +797,46 @@ class BaseToolbox(ABC):
             )
 
         if skill == "grasp":
-            success, obj_name, dist = self._grasp(target)
-            if not success:
+            localized, obj_name, dist = self._grasp(target)
+            if not localized:
+                # No graspable object under the aimed pixel — a real inability
+                # to act, so report failure (this is not a task-success verdict).
                 return ToolResult(ok=False, tool="manipulate",
-                                  summary=f"No object found to grasp.")
+                                  summary=f"Could not localize '{target}' to grasp.",
+                                  data={"skill": skill})
 
+            # A grasp was attempted on a real target. The tool does NOT judge
+            # whether the object ended up held — the verify step decides that
+            # from the next observation, so report neutrally and attach the
+            # fresh frame for it to inspect.
+            self._post_manipulate()   # retract the arm regardless of outcome
             obs_result = self.observe()
             return ToolResult(
                 ok=True, tool="manipulate",
-                summary=(f"grasp attempted: {obj_name} at dist={dist:.2f}m — "),
+                summary=f"Grasp attempted on {obj_name}.",
                 data={"skill": skill, "object": obj_name, "distance": dist},
                 image_paths=obs_result.image_paths,
             )
 
         if skill in ("place", "drop"):
-            self._release()
+            released, release_summary = self._release(
+                target=target,
+                destination=destination,
+                target_region=target_region,
+            )
+            self._post_manipulate()   # retract the arm regardless of outcome
             obs_result = self.observe()
             return ToolResult(
-                ok=True, tool="manipulate",
-                summary=f"{skill}: gripper opened.",
-                data={"skill": skill},
+                ok=released, tool="manipulate",
+                summary=f"{skill}: {release_summary}",
+                data={"skill": skill, "released": released,
+                      "destination": destination,
+                      "target_region": target_region},
                 image_paths=obs_result.image_paths,
             )
 
         return ToolResult(ok=False, tool="manipulate",
                           summary=f"Unhandled skill: {skill}")
-
-    # ── verify ────────────────────────────────────────────────────────────────
-
-    def verify(
-        self,
-        condition: str,
-        target: Optional[str] = None,
-        **_,
-    ) -> ToolResult:
-        img_path = self._last_image_path
-        if img_path is None or not os.path.exists(img_path):
-            obs = self.observe()
-            if not obs.ok:
-                return ToolResult(ok=False, tool="verify",
-                                  summary="Cannot verify: no image available.")
-            img_path = self._last_image_path
-
-        vlm    = self.gemini.verify_condition(img_path, condition, target)
-        sat    = bool(vlm.get("satisfied", False))
-        conf   = float(vlm.get("confidence", 0.0))
-        evid   = vlm.get("evidence", "")
-
-        return ToolResult(
-            ok=True, tool="verify",
-            summary=(f"verify['{condition[:60]}']: "
-                     f"satisfied={sat}  conf={conf:.2f}  {evid[:60]}"),
-            data={"condition": condition, "target": target,
-                  "satisfied": sat, "confidence": conf, "evidence": evid},
-            image_paths=[img_path],
-        )
 
     # ── wait ─────────────────────────────────────────────────────────────────
 
@@ -774,35 +870,57 @@ class BaseToolbox(ABC):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _resolve_navigate_target(
-        self, target: dict
+        self, target: Any
     ) -> tuple[Optional[np.ndarray], Optional[float], str]:
-        pose = target.get("pose", [])
-        if len(pose) >= 2:
-            xy  = np.array([float(pose[0]), float(pose[1])])
-            yaw = float(pose[2]) if len(pose) >= 3 else None
-            return xy, yaw, f"pose({xy[0]:.2f},{xy[1]:.2f})"
-        return None, None, "navigate target requires pose: [x, y] or [x, y, theta]"
+        if isinstance(target, str):
+            memory_id = normalize_memory_id(target)
+            if memory_id:
+                xy, yaw = self._pose_from_memory_id(memory_id)
+                if xy is not None:
+                    return xy, yaw, memory_id
+                return None, None, f"memory_id {memory_id} not found"
+            return None, None, "navigate target string must be a memory_id"
+
+        if not isinstance(target, dict):
+            return None, None, "navigate target requires a dict or memory_id string"
+
+        memory_id = normalize_memory_id(
+            target.get("memory_id") or target.get("mem_id") or target.get("memory")
+        )
+        if memory_id:
+            xy, yaw = self._pose_from_memory_id(memory_id)
+            if xy is not None:
+                return xy, yaw, memory_id
+            return None, None, f"memory_id {memory_id} not found"
+
+        # Raw coordinate goals are NOT accepted: navigate only goes to a
+        # remembered observation (a retrieve_memory candidate's memory_id).
+        return None, None, (
+            "navigate target must be a memory_id from retrieve_memory "
+            "(raw coordinates/pose are not accepted)"
+        )
 
     def _pose_from_memory_id(
         self, memory_id: str
     ) -> tuple[Optional[np.ndarray], Optional[float]]:
-        if self.episodic_memory is not None:
-            result = self.episodic_memory.get_pose(memory_id)
-            if result is not None:
-                return result
+        memory_id = normalize_memory_id(memory_id) or str(memory_id)
         try:
             idx_str   = memory_id.replace("mem_", "").lstrip("0") or "0"
             frame_idx = int(idx_str)
             pose_path = self.capture_out_dir / "robot_xy" / f"{frame_idx:06d}.txt"
-            if not pose_path.exists():
-                return None, None
-            data = np.loadtxt(str(pose_path)).flatten()
-            if len(data) >= 3:
-                return np.array([data[0], data[1]]), float(data[2])
-            elif len(data) >= 2:
-                return np.array([data[0], data[1]]), None
+            if pose_path.exists():
+                data = np.loadtxt(str(pose_path)).flatten()
+                if len(data) >= 3:
+                    return np.array([data[0], data[1]]), float(data[2])
+                if len(data) >= 2:
+                    return np.array([data[0], data[1]]), None
         except Exception as e:
-            print(f"[Toolbox] _pose_from_memory_id error: {e}")
+            print(f"[Toolbox] _pose_from_memory_id file lookup error: {e}")
+
+        if self.episodic_memory is not None:
+            result = self.episodic_memory.get_pose(memory_id)
+            if result is not None:
+                return result
         return None, None
 
     def _estimate_object_xy_from_depth(
@@ -892,28 +1010,6 @@ class BaseToolbox(ABC):
               f"world_xy=({obj_xy[0]:.2f},{obj_xy[1]:.2f})")
         return obj_xy
 
-    def _forward_approach(
-        self, desired_distance: float, target_label: str
-    ) -> ToolResult:
-        # Walk at most desired_distance + 0.5m (≈ reach margin) forward.
-        # _forward_step moves 0.015 m per call (NAV_FWD_M_PER_STEP).
-        n_steps = max(1, int((desired_distance + 0.5) / 0.015))
-        for i in range(n_steps):
-            if i % self._EVENT_EVERY == 0:
-                self._pump_events()
-            self._forward_step()
-            self._last_obs = self._step()
-
-
-        obs_result = self.observe()
-        return ToolResult(
-            ok=True, tool="approach",
-            summary=(f"approach(blind forward {n_steps} steps / "
-                     f"{n_steps*0.015:.2f}m): '{target_label}'"),
-            data={"target": target_label, "approximation": "blind_forward"},
-            image_paths=obs_result.image_paths,
-        )
-
     def _align_yaw(self, target_yaw: float) -> None:
         # kinematic_nav_step moves FORWARD when |bearing| < ROT_THRESH (~8°).
         # Clamp bearing to always exceed that threshold so we only rotate here.
@@ -928,6 +1024,10 @@ class BaseToolbox(ABC):
             self._navigate_step(bearing)
             self._step()
 
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        return (a - b + math.pi) % (2 * math.pi) - math.pi
+
     def _snap_to_navmesh(self, xy: np.ndarray) -> np.ndarray:
         """Snap xy to nearest navmesh vertex if available. Override to add navmesh."""
         return xy
@@ -935,6 +1035,14 @@ class BaseToolbox(ABC):
     def _save_frame(self, rgb: np.ndarray, tag: str) -> str:
         from PIL import Image as _PIL
         self._step_counter += 1
+        path = str(self.log_dir / "images" / f"{self._step_counter:04d}_{tag}.png")
+        _PIL.fromarray(rgb).save(path)
+        return path
+
+    def _save_companion_frame(self, rgb: np.ndarray, tag: str) -> str:
+        """Save an extra frame for the CURRENT step (e.g. the wrist view) without
+        advancing the step counter, so it pairs with the head frame just saved."""
+        from PIL import Image as _PIL
         path = str(self.log_dir / "images" / f"{self._step_counter:04d}_{tag}.png")
         _PIL.fromarray(rgb).save(path)
         return path

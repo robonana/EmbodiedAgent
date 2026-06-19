@@ -17,8 +17,8 @@ from .env import (
     _load_replicacad_nav_positions,
     find_clear_spawn,
 )
-from ..agent.episodic_memory import EpisodicMemory
-from ..memory.embedding import EmbeddingWorker
+from agent.episodic_memory import EpisodicMemory
+from memory.embedding import EmbeddingWorker
 
 
 def setup_sim(args) -> dict:

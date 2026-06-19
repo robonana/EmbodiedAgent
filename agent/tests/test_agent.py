@@ -74,12 +74,17 @@ class TestSchemas(unittest.TestCase):
         d = {
             "tool": "observe",
             "arguments": {},
+            "previous_action_verification": "Previous action verification: no previous action yet.",
             "rationale": "test",
             "expected_progress": "get image",
         }
         action = ToolAction.from_dict(d)
         self.assertEqual(action.tool, "observe")
         self.assertEqual(action.rationale, "test")
+        self.assertEqual(
+            action.previous_action_verification,
+            "Previous action verification: no previous action yet.",
+        )
 
     def test_tool_result_to_dict(self):
         from sceneagent.agent.schemas import ToolResult
@@ -102,6 +107,13 @@ class TestSchemas(unittest.TestCase):
         d = mc.to_dict()
         self.assertEqual(d["memory_id"], "mem_000042")
         self.assertAlmostEqual(d["retrieval_score"], 0.87)
+
+    def test_normalize_memory_id(self):
+        from sceneagent.agent.schemas import normalize_memory_id
+        self.assertEqual(normalize_memory_id("mem42"), "mem_000042")
+        self.assertEqual(normalize_memory_id("MEM_42"), "mem_000042")
+        self.assertEqual(normalize_memory_id("mem_000042"), "mem_000042")
+        self.assertIsNone(normalize_memory_id("kitchen"))
 
 
 
@@ -143,6 +155,13 @@ class TestVerifier(unittest.TestCase):
             {"target": {"pose": [1.0, 2.0, 0.0]}})
         self.assertTrue(valid)
 
+    def test_navigate_memory_id_accepted(self):
+        from sceneagent.agent.verifier import check_tool_argument_validity
+        valid, _ = check_tool_argument_validity(
+            "navigate",
+            {"target": {"memory_id": "mem_000042"}})
+        self.assertTrue(valid)
+
     def test_unsupported_skill(self):
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity(
@@ -155,6 +174,34 @@ class TestVerifier(unittest.TestCase):
         valid, reason = check_tool_argument_validity("fly_robot", {})
         self.assertFalse(valid)
         self.assertEqual(reason, "invalid_tool")
+
+    def test_verify_tool_is_invalid(self):
+        from sceneagent.agent.verifier import check_tool_argument_validity
+        valid, reason = check_tool_argument_validity(
+            "verify", {"condition": "object visible"})
+        self.assertFalse(valid)
+        self.assertEqual(reason, "invalid_tool")
+
+    def test_approach_tool_is_invalid(self):
+        from sceneagent.agent.verifier import check_tool_argument_validity
+        valid, reason = check_tool_argument_validity(
+            "approach", {"target": "cup", "desired_distance": 0.5})
+        self.assertFalse(valid)
+        self.assertEqual(reason, "invalid_tool")
+
+    def test_base_move_valid(self):
+        from sceneagent.agent.verifier import check_tool_argument_validity
+        valid, reason = check_tool_argument_validity(
+            "base_move", {"motion": "rotate -30 degrees"})
+        self.assertTrue(valid)
+        self.assertIsNone(reason)
+
+    def test_base_move_invalid_motion(self):
+        from sceneagent.agent.verifier import check_tool_argument_validity
+        valid, reason = check_tool_argument_validity(
+            "base_move", {"motion": "diagonal"})
+        self.assertFalse(valid)
+        self.assertEqual(reason, "invalid_arguments")
 
     def test_inspect_bad_bbox(self):
         from sceneagent.agent.verifier import check_tool_argument_validity
@@ -188,14 +235,21 @@ class TestPromptLoopMock(unittest.TestCase):
     def _make_mock_sequence(self) -> list[dict]:
         return [
             {"tool": "retrieve_memory", "arguments": {"query": "water bottle", "top_k": 3},
+             "previous_action_verification": "Previous action verification: no previous action yet.",
+             "progress_analysis": "Need to find the water bottle.",
              "rationale": "not visible","expected_progress": "find memory"},
             {"tool": "navigate",
-             "arguments": {"target": {"pose": [1.0, 2.0, 0.0]}},
-             "rationale": "go there",   "expected_progress": "move to pose"},
-            {"tool": "verify",
-             "arguments": {"condition": "object visible", "target": "water bottle"},
-             "rationale": "check",      "expected_progress": "confirm"},
+             "arguments": {"target": {"memory_id": "mem_000001"}},
+             "previous_action_verification": "Previous action verification: succeeded; memory candidates were returned.",
+             "progress_analysis": "A likely water bottle memory pose is available.",
+             "rationale": "go there",   "expected_progress": "move to memory candidate"},
+            {"tool": "base_move", "arguments": {"motion": "forward"},
+             "previous_action_verification": "Previous action verification: succeeded; the mock navigation completed.",
+             "progress_analysis": "At the likely pose; move slightly closer for the mock handoff.",
+             "rationale": "close distance", "expected_progress": "adjust base"},
             {"tool": "finish",          "arguments": {"answer": "done"},
+             "previous_action_verification": "Previous action verification: succeeded; the mock base_move completed.",
+             "progress_analysis": "The mock task is complete.",
              "rationale": "success",    "expected_progress": "end"},
         ]
 
@@ -288,6 +342,8 @@ class TestPromptLoopMock(unittest.TestCase):
         # Always return same wait action (observe is no longer a valid tool)
         mock_gemini.call_policy.return_value = {
             "tool": "wait", "arguments": {"seconds": 1},
+            "previous_action_verification": "Previous action verification: uncertain in mock.",
+            "progress_analysis": "Still waiting in mock.",
             "rationale": "stuck", "expected_progress": "help"}
         mock_gemini.model_name = "mock"
 
@@ -436,6 +492,46 @@ class TestEpisodicMemory(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             mem = EpisodicMemory(memory_dir=tmpdir)
             self.assertIsNone(mem.get_pose("mem_999999"))
+
+    def test_memory_id_navigation_prefers_robot_xy_file(self):
+        from sceneagent.agent.episodic_memory import EpisodicMemory
+        from sceneagent.agent.toolbox_base import BaseToolbox
+
+        class DummyToolbox(BaseToolbox):
+            def _step(self): return {}
+            def _capture_rgb(self, obs): return None
+            def _get_robot_pose(self): return [0.0, 0.0, 0.0]
+            def _navigate_step(self, bearing): pass
+            def _base_move_step(self, motion): pass
+            def _plan_path(self, start_xy, goal_xy): return [start_xy, goal_xy]
+            def _grasp(self, target): return False, target, 0.0
+            def _release(self, target="", destination=None, target_region=None):
+                return True, "released"
+            def _forward_step(self): pass
+            def _get_depth_and_intrinsics(self, obs): return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cap = os.path.join(tmpdir, "captures")
+            os.makedirs(os.path.join(cap, "robot_xy"))
+            with open(os.path.join(cap, "robot_xy", "000065.txt"), "w") as f:
+                f.write("-2.8894329 -0.9700761 0.0125347\n")
+
+            mem = EpisodicMemory(memory_dir=os.path.join(tmpdir, "memory"))
+            mem.add_entry(mem.create_entry(
+                "mem_000065",
+                "/tmp/000065.png",
+                [-2.8894329, 0.0, -0.9700761],
+            ))
+            tb = DummyToolbox(
+                gemini_client=None,
+                log_dir=os.path.join(tmpdir, "log"),
+                capture_out_dir=cap,
+                episodic_memory=mem,
+            )
+            xy, yaw = tb._pose_from_memory_id("mem_000065")
+            self.assertAlmostEqual(float(xy[0]), -2.8894329)
+            self.assertAlmostEqual(float(xy[1]), -0.9700761)
+            self.assertAlmostEqual(float(yaw), 0.0125347)
 
     def test_index_persists(self):
         """Index survives reload from disk."""

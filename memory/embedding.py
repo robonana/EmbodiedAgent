@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 embedding.py — Real-time FAISS index builder + in-process query.
 

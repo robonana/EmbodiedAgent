@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 capture.py — Navigation frame capture.
 

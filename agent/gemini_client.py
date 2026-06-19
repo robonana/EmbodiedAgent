@@ -90,7 +90,7 @@ class GeminiClient:
         system_prompt: Optional[str] = None,
         max_retries: Optional[int] = None,
     ) -> dict[str, Any]:
-        """Generic JSON generation call (for inspect, verify, rerank, etc.)."""
+        """Generic JSON generation call (for inspect, rerank, etc.)."""
         self._call_count += 1
         tag   = f"gen_{self._call_count:04d}"
         parts: list = []
@@ -129,22 +129,6 @@ class GeminiClient:
             return {"answer": "image_load_error", "evidence": "",
                     "confidence": 0.0, "candidate_bboxes": []}
         return self._call_with_retry(parts, f"inspect_{self._call_count+1:04d}")
-
-    def verify_condition(
-        self,
-        image_path: str,
-        condition: str,
-        target: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Check a condition visually.  Returns {satisfied, confidence, evidence}."""
-        from .prompts import build_verify_prompt
-        prompt = build_verify_prompt(condition, target)
-        images = self._load_images([image_path])
-        if not images:
-            return {"satisfied": False, "confidence": 0.0,
-                    "evidence": "no image", "suggested_failure_type": "uncertain_visual_evidence"}
-        parts = [prompt] + images
-        return self._call_with_retry(parts, f"verify_{self._call_count+1:04d}")
 
     def rerank_memory_candidates(
         self,
@@ -239,7 +223,7 @@ class GeminiClient:
                 # Build repair prompt for next attempt
                 repair_parts = [
                     parts[0] if parts else "",
-                    f"Your previous response was not valid JSON:\n{raw[:400]}\n\n"
+                    f"Your previous response was not valid JSON:\n{raw}\n\n"
                     f"Output ONLY the corrected JSON object. "
                     f"No markdown fences, no extra text.",
                 ]

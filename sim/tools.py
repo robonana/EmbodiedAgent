@@ -1,10 +1,8 @@
 """
 sim/tools.py — AgentToolbox: ManiSkill/ReplicaCAD implementation of the agent toolbox.
 
-Implements the ten abstract primitives of BaseToolbox for ManiSkill/SAPIEN.
-All shared tool logic (navigate, approach, manipulate, inspect, …) lives in BaseToolbox.
-Ground-truth simulator lookups are used ONLY in the primitives below, never
-surfaced in ToolResult summaries that reach the Gemini policy prompt.
+Implements the abstract primitives of BaseToolbox for ManiSkill/SAPIEN.
+All shared tool logic (navigate, base_move, manipulate, inspect, …) lives in BaseToolbox.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..agent.toolbox_base import BaseToolbox
+from agent.toolbox_base import BaseToolbox
 
 # ── Arm geometry constants (from xlerobot.urdf) ───────────────────────────────
 # arm_base_joint xyz=(-0.135, -0.133, 0.760), rpy=(0,0,π/2) → Rotation joint
@@ -107,7 +105,7 @@ class AgentToolbox(BaseToolbox):
         self._capture_interval = capture_interval
         self._last_bg_capture_t: float = -1e9
 
-        # Lazy NavGrid — built on first navigate/approach call
+        # Lazy NavGrid — built on first navigate call
         self._nav_grid = None
 
     # ── Abstract primitive implementations ───────────────────────────────────
@@ -127,7 +125,7 @@ class AgentToolbox(BaseToolbox):
             return
         from .capture import _capture_nav_frame
         from .env import get_robot_xy, get_robot_yaw
-        from ..agent.episodic_memory import frame_to_memory_id
+        from agent.episodic_memory import frame_to_memory_id
         rgb = _capture_nav_frame(obs)
         if rgb is None:
             return
@@ -160,6 +158,33 @@ class AgentToolbox(BaseToolbox):
     def _navigate_step(self, bearing: float) -> None:
         from .nav_grid import kinematic_nav_step
         kinematic_nav_step(self.agent, bearing)
+
+    def _base_move_step(self, motion: str) -> None:
+        from .env import NAV_FWD_M_PER_STEP, NAV_ROT_RAD_PER_STEP
+
+        qp = self.agent.robot.get_qpos().cpu().numpy().flatten().copy()
+        yaw = float(qp[2])
+        if motion == "forward":
+            step_yaw = yaw
+            qp[0] += NAV_FWD_M_PER_STEP * math.cos(step_yaw)
+            qp[1] += NAV_FWD_M_PER_STEP * math.sin(step_yaw)
+        elif motion == "backward":
+            step_yaw = yaw + math.pi
+            qp[0] += NAV_FWD_M_PER_STEP * math.cos(step_yaw)
+            qp[1] += NAV_FWD_M_PER_STEP * math.sin(step_yaw)
+        elif motion == "left":
+            step_yaw = yaw + math.pi / 2
+            qp[0] += NAV_FWD_M_PER_STEP * math.cos(step_yaw)
+            qp[1] += NAV_FWD_M_PER_STEP * math.sin(step_yaw)
+        elif motion == "right":
+            step_yaw = yaw - math.pi / 2
+            qp[0] += NAV_FWD_M_PER_STEP * math.cos(step_yaw)
+            qp[1] += NAV_FWD_M_PER_STEP * math.sin(step_yaw)
+        elif motion == "rotate 30 degrees":
+            qp[2] += NAV_ROT_RAD_PER_STEP
+        elif motion == "rotate -30 degrees":
+            qp[2] -= NAV_ROT_RAD_PER_STEP
+        self.agent.robot.set_qpos(qp)
 
     def _plan_path(
         self, start_xy: np.ndarray, goal_xy: np.ndarray
@@ -259,19 +284,21 @@ class AgentToolbox(BaseToolbox):
 
         return True, obj_name, dist
 
-    def _release(self) -> None:
+    def _release(
+        self,
+        target: str = "",
+        destination: Optional[str] = None,
+        target_region: Optional[str] = None,
+    ) -> tuple[bool, str]:
         qp     = self.agent.robot.get_qpos().cpu().numpy().flatten().copy()
         qp[15] = _GRIPPER_OPEN
         self.agent.robot.set_qpos(qp)
         for _ in range(20):
             self._step()
+        return True, "gripper opened."
 
     def _forward_step(self) -> None:
-        qp  = self.agent.robot.get_qpos().cpu().numpy().flatten().copy()
-        yaw = qp[2]
-        qp[0] += 0.015 * math.cos(yaw)
-        qp[1] += 0.015 * math.sin(yaw)
-        self.agent.robot.set_qpos(qp)
+        self._base_move_step("forward")
 
     def _get_depth_and_intrinsics(
         self, obs: dict
@@ -324,4 +351,3 @@ class AgentToolbox(BaseToolbox):
             print(f"[AgentToolbox] NavGrid build failed: {e}")
             self._nav_grid = None
         return self._nav_grid
-

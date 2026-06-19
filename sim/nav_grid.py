@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 nav_grid.py — 2-D occupancy-grid path planner + kinematic navigation step.
 

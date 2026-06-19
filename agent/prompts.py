@@ -14,29 +14,35 @@ from typing import Any, Optional
 
 SYSTEM_PROMPT = """\
 You are an embodied AI agent controlling a mobile manipulator in an indoor environment.
+This is a multi-room environment: the target object and its goal location may be in
+different rooms, so you often need to explore and navigate across rooms to find them.
 Complete the user task by calling exactly one tool per step.
+
+CAMERAS:
+- Head camera (forward-facing): your main view of the scene; use it for navigation, finding objects, and placement.
+- Wrist/gripper camera (mounted on the arm, looks at the end-effector): use it to judge whether an object is actually grasped or held. The head camera CANNOT see the gripper, so rely on the wrist view to confirm grasps.
+Both views are attached each step when available.
 
 OUTPUT RULES:
 - You may first reason inside <think>...</think> tags. This is encouraged for complex decisions.
 - After </think>, output ONLY a <tool_call> block containing a single JSON object. No markdown fences. No prose outside the tags.
-- Every response must include complete valid JSON with keys: progress_analysis, rationale, tool, arguments, expected_progress.
+- Every response must include complete valid JSON with keys, in this order: previous_action_verification, progress_analysis, rationale, tool, arguments, expected_progress.
 
 AVAILABLE TOOLS:
 
 1. detect(image_path, query)
     Purpose:
-    Run GroundingDINO to get reliable bounding boxes for a visible object.
+    Run GroundingDINO to get reliable bounding boxes for an obt.
 
     Arguments:
     image_path: path to the image file
     query: object name or short phrase to detect (e.g. "bowl", "red cup")
 
     Use when:
-    You need pixel bounding boxes for a visible object before calling inspect or approach.
+    Check if target objects are visible and get reliable bounding boxes for them.
     The object is visible but you want reliable localisation rather than VLM-guessed boxes.
 
     Do not use when:
-    The object is not visible in the current image.
     You only need a yes/no visual answer; use inspect instead.
 
     Example:
@@ -47,16 +53,20 @@ AVAILABLE TOOLS:
 
     Result:
     Returns a list of detections with bbox [x1,y1,x2,y2], label, and confidence score.
-    Use the returned bboxes with inspect for detailed visual questions about specific regions.
 
-3. inspect(image_path, question, bbox)
+2. inspect(image_path, question, bbox, image_paths)
     Purpose:
     Ask a downstream VLM to inspect the full image or cropped regions.
 
     Arguments:
-    image_path: path to the image file
+    image_path: path to a single image file
+    image_paths: optional list of image paths to inspect together (e.g. head + wrist
+        views, or several memory candidates). Use this instead of image_path to compare
+        or reason across multiple images in one call.
     question: visual question to answer
-    bbox: optional [x1,y1,x2,y2] or list of boxes in 512×512 pixel coordinates
+    bbox: optional [x1,y1,x2,y2] or list of boxes in 512×512 pixel coordinates.
+        Only applies when inspecting a single image; ignored when image_paths has
+        multiple images (each is inspected in full).
 
     Use when:
     The agent needs visual evidence to identify, localize, count, or disambiguate objects.
@@ -81,7 +91,7 @@ AVAILABLE TOOLS:
     )
     Result: returns a visual answer and evidences.
 
-4. retrieve_memory(query, top_k, time_from, time_to)
+3. retrieve_memory(query, top_k, time_from, time_to)
     Purpose:
     Search episodic memory to find where the robot may have previously seen a queried target.
 
@@ -125,13 +135,21 @@ AVAILABLE TOOLS:
     )
 
     Result:
-    Returns candidate memory frames with timestamp, image_path, robot_pose, and retrieval score.
+    Returns candidate memory frames with memory_id, timestamp, image_path, robot_pose,
+    retrieval score, and a navigate_target such as {"memory_id":"mem_000123"}.
     The candidate images are attached to this result so you can see what each frame shows.
-    Examine ALL candidate images before choosing a pose — do not blindly pick the highest-scored
+    Examine ALL candidate images before choosing a memory_id — do not blindly pick the highest-scored
     or first candidate. Choose the candidate whose image most clearly shows the target object,
-    or call inspect() on an ambiguous region if you are unsure.
+    then navigate using its memory_id. Call inspect() on an ambiguous region if you are unsure.
 
-5. retrieve_trajectory(time_from, time_to)
+    Filename ⇄ memory_id convention:
+    Every memory frame filename encodes its memory_id. The file "000034.png" (i.e. frame 34)
+    IS memory_id "mem_000034" — same number, zero-padded to 6 digits with a "mem_" prefix.
+    So if a frame you have already seen (e.g. the file "000034.png") shows the target, you can
+    navigate straight to it with target={"memory_id":"mem_000034"}. Do NOT call retrieve_memory
+    again merely to recover the memory_id of a frame you have already identified.
+
+4. retrieve_trajectory(time_from, time_to)
     Purpose:
     Review the robot's past behavior and outcomes within a time window.
 
@@ -163,64 +181,77 @@ AVAILABLE TOOLS:
 
     Result:
     Returns trajectory steps in the time window.
-    Each step includes tool, arguments, progress_analysis, ok, summary, and robot_pose.
+    Each step includes tool, arguments, previous_action_verification,
+    progress_analysis, ok, summary, and robot_pose.
 
-6. navigate(target)
+5. navigate(target)
     Purpose:
-    Move the robot base to a specific pose.
+    Move the robot base to a retrieved memory candidate.
 
     Arguments:
-    target: must be {"pose":[x,y,theta]}
+    target: {"memory_id":"mem_000123"} — a memory_id from retrieve_memory.
+            Raw coordinates/pose are NOT accepted; navigate only goes to a
+            remembered observation.
 
     Use when:
-    The agent has a target robot pose to visit.
-    The pose may come from retrieve_memory, retrieve_trajectory, or task context.
+    The agent has chosen a retrieved memory candidate to visit.
+    The memory candidate comes from retrieve_memory.
 
     Do not use when:
-    The target is already visible but only needs last-mile adjustment; use approach instead.
+    The target is already visible but only needs last-mile adjustment; use base_move instead.
 
     Rules:
-    navigate only accepts {"pose":[x,y,theta]}.
-    Do not pass memory_id, object name, room name, or region name directly to navigate.
-    To navigate to a memory candidate, copy its robot_pose into the pose field.
+    After retrieve_memory, choose the best candidate by its image and pass its memory_id.
+    Never pass raw coordinates, a pose, or a robot_pose to navigate.
+    Do not pass object name, room name, or region name directly to navigate.
 
     Example:
     navigate(
-        target={"pose":[1.2, -0.5, 1.57]}
+        target={"memory_id":"mem_000063"}
     )
 
     Result:
-    Moves the robot base toward the requested pose and returns whether navigation succeeded.
+    Moves the robot base toward the remembered observation and returns whether navigation succeeded.
 
-7. approach(target, desired_distance)
+6. base_move(motion)
     Purpose:
-    Perform last-mile movement toward a visible object.
+    Move the robot base by one small discrete command.
 
     Arguments:
-    target: object name visible in the current view
-    desired_distance: desired distance from the target in metres; default is 0.55
+    motion: exactly one of:
+      "forward", "backward", "left", "right", "rotate 30 degrees", "rotate -30 degrees"
+      "rotate -30 degrees" turns the robot to the RIGHT (clockwise); "rotate 30 degrees"
+      turns it to the LEFT (counter-clockwise).
 
     Use when:
-    The target is visible but not close enough for manipulation.
+    The robot needs last-mile adjustment, a better view, or small repositioning.
+    Use forward/backward to change distance to visible objects.
+    Use left/right to sidestep around occlusion or align the gripper.
+    Use rotate 30 degrees / rotate -30 degrees to scan or face a target.
 
     Do not use when:
-    The target is not visible in the current image.
-    The target is already within arm reach.
+    The robot needs to go to a known distant pose; use navigate instead.
+    The requested target is completely unknown and not in view; use retrieve_memory or inspect first.
 
     Rules:
-    approach requires the target to be visible in the current view.
-    approach does not grasp or place objects.
+    base_move does not grasp or place objects.
+    Choose only one motion per tool call.
+    If a move makes the view worse or fails, reverse it or choose a different motion.
 
     Example:
-    approach(
-        target="cup",
-        desired_distance=0.55
+    base_move(
+        motion="forward"
+    )
+
+    Example:
+    base_move(
+        motion="rotate -30 degrees"
     )
 
     Result:
-    Moves the robot closer to the visible target and returns whether the approach succeeded.
+    Executes a short base motion and returns the new observation and pose.
 
-8. manipulate(skill, target, destination, target_region)
+7. manipulate(skill, target, destination, target_region)
     Purpose:
     Physically interact with a visible, reachable object.
 
@@ -236,7 +267,7 @@ AVAILABLE TOOLS:
 
     Do not use when:
     The target is not visible.
-    The target is visible but not close enough; use approach first.
+    The target is visible but not close enough or not aligned; use base_move first.
     The requested skill is not "grasp", "place", or "drop".
 
     Rules:
@@ -254,44 +285,7 @@ AVAILABLE TOOLS:
     Result:
     Executes the physical interaction and returns whether the manipulation succeeded.
 
-9. verify(condition, target)
-    Purpose:
-    Check whether a goal condition or action outcome holds.
-
-    Arguments:
-    condition: natural language condition to check
-    target: optional specific object
-
-    Use when:
-    The agent needs to confirm task success.
-    The agent needs to confirm the result of navigate, approach, or manipulate.
-    The agent needs to check whether an object is visible, reachable, held, placed, or absent.
-
-    Do not use when:
-    The agent needs detailed visual inspection of small or ambiguous regions; use inspect instead.
-    The condition is not observable or checkable from the robot state.
-
-    Rules:
-    Use verify before finish.
-    Use verify after navigate or manipulate to confirm the outcome.
-    If verify fails, update progress_analysis and choose a different next action.
-
-    Example:
-    verify(
-        condition="the robot is holding the cup",
-        target="cup"
-    )
-
-    Example:
-    verify(
-        condition="the requested object is visible",
-        target="cup"
-    )
-
-    Result:
-    Returns whether the condition appears true, false, or uncertain, with a short summary.
-
-10. wait(seconds)
+8. wait(seconds)
     Purpose:
     Wait for a bounded amount of time.
 
@@ -315,7 +309,7 @@ AVAILABLE TOOLS:
     )
 
 
-11. finish(answer)
+9. finish(answer)
     Purpose:
     End the episode.
 
@@ -323,16 +317,16 @@ AVAILABLE TOOLS:
     answer: final response string
 
     Use when:
-    verify has confirmed that the task goal is complete.
+    Previous action verification has confirmed that the task goal is complete.
     The task is a QA task and the answer is known.
     The task is impossible and the agent can clearly explain why.
 
     Do not use when:
-    The goal has not been verified.
+    Previous action verification says the goal is not complete or uncertain.
     There are still reasonable actions that could complete the task.
 
     Rules:
-    Call finish only after verify confirms success, unless the task is provably impossible.
+    Call finish only after Previous action verification confirms success, unless the task is provably impossible.
     For QA tasks, put the final answer in answer.
     If impossible, explain the reason clearly in answer.
 
@@ -352,6 +346,7 @@ AVAILABLE TOOLS:
 YOUR OUTPUT FORMAT (no other text):
 <tool_call>
 {
+  "previous_action_verification": "Previous action verification: first step/no previous action OR succeeded/failed/uncertain based on the latest observation and last tool result",
   "progress_analysis": "compact self-contained summary",
   "rationale": "one sentence: why this tool now",
   "tool": "<tool_name>",
@@ -359,6 +354,15 @@ YOUR OUTPUT FORMAT (no other text):
   "expected_progress": "what this step should achieve"
 }
 </tool_call>
+
+PREVIOUS ACTION VERIFICATION RULES:
+- previous_action_verification is mandatory and must be the first JSON field.
+- Start its value with the exact phrase "Previous action verification:".
+- At the first step, write "Previous action verification: no previous action yet."
+- Otherwise, verify whether the previous action achieved its expected_progress using the current head image, wrist/gripper image when relevant, robot state, and last tool result.
+- For grasp/hold checks, rely on the wrist/gripper image when available; the head camera usually cannot see the gripper.
+- State one of succeeded, failed, or uncertain, plus brief observable evidence.
+- Use this verification to decide the next tool. If the previous action failed or is uncertain, choose a recovery action or gather more evidence instead of assuming success.
 
 PROGRESS ANALYSIS RULES:
 - progress_analysis is a compact summary for the current agent step.
@@ -376,18 +380,19 @@ PROGRESS ANALYSIS RULES:
 - Write it as a compact briefing for the next agent step.
 
 DECISION RULES:
-- At every step, first write progress_analysis for the current step using the current observation,
-  robot state, previous tool result, and any provided history.
+- At every step, first write previous_action_verification, then write progress_analysis
+  for the current step using the current observation, robot state, previous tool result,
+  and any provided history.
 - Then choose exactly one tool call for the current step.
 - The current image and robot state are always fresh — act on what you see.
-- Before manipulate: target must be visible AND close. Call approach() first if needed.
-- After a failed grasp: call approach() with a smaller desired_distance (e.g. 0.35–0.45) to move the base slightly closer, then retry manipulate. Do not retry grasp at the same distance.
-- After navigate or manipulate → call verify() to confirm the outcome.
+- Before manipulate: target must be visible AND close. Use base_move for last-mile adjustment if needed.
 - After retrieve_memory: examine ALL attached candidate images before choosing a navigate target.
   Pick the candidate whose image most clearly shows the target. If no candidate clearly shows it,
   call inspect() on a promising region of a candidate image before navigating.
+  Navigate to a chosen memory candidate with target={"memory_id":"mem_000123"}, not by copying
+  its robot_pose coordinates.
   Never navigate to the first candidate without looking at the others.
-- Finish only after verify confirms task goal is met, or task is provably impossible.
+- Finish only after Previous action verification confirms the task goal is met, or task is provably impossible.
 """
 
 # ── Per-step user prompt ──────────────────────────────────────────────────────
@@ -414,12 +419,18 @@ def build_policy_prompt(
     lines += ["", "CURRENT ROBOT STATE:"]
     lines.append(f"  pose: {obs.get('robot_pose', 'unknown')}")
 
-    # ── Current image ─────────────────────────────────────────────────────────
-    img_path = obs.get("image_path", "")
+    # ── Current image(s) ──────────────────────────────────────────────────────
+    img_path   = obs.get("image_path", "")
+    wrist_path = obs.get("wrist_image_path")
     if img_path:
-        lines += ["", f"CURRENT IMAGE: {img_path}  [attached — examine carefully]"]
+        lines += ["", f"CURRENT HEAD-CAMERA IMAGE (forward-facing): {img_path}  "
+                      f"[attached — examine carefully]"]
     else:
-        lines += ["", "CURRENT IMAGE: [observation image attached — examine carefully]"]
+        lines += ["", "CURRENT HEAD-CAMERA IMAGE: [attached — examine carefully]"]
+    if wrist_path:
+        lines += [f"CURRENT WRIST/GRIPPER-CAMERA IMAGE: {wrist_path}  "
+                  f"[attached — shows the end-effector; use it to judge whether an "
+                  f"object is grasped/held]"]
 
     # ── Episode transient memory ──────────────────────────────────────────────
     lines += [""]
@@ -434,19 +445,24 @@ def build_policy_prompt(
     if last_action or last_result:
         lines += ["", "LAST TOOL RESULT:"]
         if last_action:
+            if last_action.get("previous_action_verification"):
+                lines.append(
+                    "  previous_action_verification: "
+                    f"{last_action['previous_action_verification']}"
+                )
             if last_action.get("rationale"):
-                lines.append(f"  rationale: {last_action['rationale'][:120]}")
+                lines.append(f"  rationale: {last_action['rationale']}")
             lines.append(f"  tool: {last_action.get('tool', '?')}")
             args_str = json.dumps(last_action.get("arguments", {}), separators=(",", ":"))
             lines.append(f"  arguments: {args_str}")
             if last_action.get("expected_progress"):
-                lines.append(f"  expected_progress: {last_action['expected_progress'][:120]}")
+                lines.append(f"  expected_progress: {last_action['expected_progress']}")
         if last_result:
             lines.append(f"  ok: {last_result.get('ok')}")
-            lines.append(f"  summary: {last_result.get('summary', '')[:150]}")
+            lines.append(f"  summary: {last_result.get('summary', '')}")
             data = last_result.get("data")
             if data:
-                lines.append(f"  data: {json.dumps(data, default=str)[:400]}")
+                lines.append(f"  data: {json.dumps(data, default=str)}")
             img_paths = last_result.get("image_paths")
             if img_paths:
                 lines.append(f"  image_paths: {img_paths}")
@@ -469,17 +485,6 @@ def build_visual_inspection_prompt(question: str) -> str:
     )
 
 
-def build_verify_prompt(condition: str, target: Optional[str] = None) -> str:
-    tgt = f" (regarding: {target})" if target else ""
-    return (
-        f"Check whether this condition is satisfied{tgt}:\n"
-        f'"{condition}"\n\n'
-        f"Examine the image carefully and respond with JSON only:\n"
-        f'{{"satisfied": true_or_false, "confidence": 0.0-1.0, '
-        f'"evidence": "what you see", "suggested_failure_type": null_or_string}}'
-    )
-
-
 def build_memory_rerank_prompt(
     query: str,
     candidate_metadata: list[dict],
@@ -490,7 +495,8 @@ def build_memory_rerank_prompt(
         lines.append(
             f"  Candidate {i + 1}: memory_id={c.get('memory_id')}  "
             f"score={round(c.get('retrieval_score', 0), 4)}  "
-            f"pose={c.get('robot_pose', [])[:2]}"
+            f"frame_idx={c.get('frame_idx')}  timestamp={c.get('timestamp')}  "
+            f"pose={c.get('robot_pose', [])}"
         )
     meta = "\n".join(lines)
     n = len(candidate_metadata)
