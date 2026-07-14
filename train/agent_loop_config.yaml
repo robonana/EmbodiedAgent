@@ -1,0 +1,26 @@
+# Custom agent loops for verl. Referenced by
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path=train/agent_loop_config.yaml
+#   actor_rollout_ref.rollout.agent.default_agent_loop=habitat
+#
+# Every key except `name` and `_target_` is forwarded to the class __init__.
+# `env_server_urls` must list one running train/habitat_env_server.py per entry;
+# each server drives exactly one episode at a time, so the list length is the
+# rollout concurrency for this trainer process. HABITAT_ENV_SERVERS overrides it.
+- name: habitat
+  _target_: train.habitat_agent_loop.HabitatAgentLoop
+  env_server_urls:
+    - http://127.0.0.1:8100
+    - http://127.0.0.1:8101
+    - http://127.0.0.1:8102
+    - http://127.0.0.1:8103
+  # Must not exceed the env server's --max_steps; the server also stops the
+  # episode on `finish`, task_done, or a 10x repeated action.
+  max_turns: 16
+  # Per-turn generation cap. Qwen3.5-9B with thinking on will otherwise spend the
+  # entire rollout.response_length on one turn's reasoning, never step the
+  # environment, and score 0 -> zero advantage. Must leave room for max_turns
+  # turns inside response_length.
+  max_turn_tokens: 2048
+  # A cold reset loads an HSSD scene and scans it; later rollouts of the same
+  # episode restore the post-scan snapshot instead.
+  request_timeout: 1800.0

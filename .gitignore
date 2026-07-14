@@ -65,3 +65,6 @@ OWMM-Agent/
 # OS
 .DS_Store
 Thumbs.db
+
+# Dead/old code, kept locally only
+backup/

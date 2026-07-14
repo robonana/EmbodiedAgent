@@ -68,7 +68,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # ── Agent ──────────────────────────────────────────────────────────────────
     p.add_argument("--vlm_model",          default="gemini-2.5-pro")
     p.add_argument("--gemini_api_key",
-                   default=os.environ.get("GOOGLE_API_KEY", "AIzaSyCdE4FkuAS0h6EtAvLSCXAXpKq6bpo-uB4"))
+                   default=os.environ.get("GOOGLE_API_KEY", os.environ.get("GEMINI_API_KEY", "")))
     p.add_argument("--grounding_dino_model", default=None, metavar="MODEL_ID",
                    help="HuggingFace model ID for GroundingDINO bbox proposals "
                         "(e.g. IDEA-Research/grounding-dino-tiny). Disabled if not set.")

@@ -201,10 +201,92 @@ def _prepopulate_memory(ep_id: int, embedding_worker, episodic_memory):
     print(f"[prepopulate] indexed {len(images)} scene graph images for ep {ep_id}", flush=True)
 
 
+# ── VLM CLI args ──────────────────────────────────────────────────────────────
+
+# Default gemini policy model (overridden to a local OpenAI model when needed).
+_GEMINI_DEFAULT_MODEL = "models/gemini-3.5-flash"
+_OPENAI_DEFAULT_MODEL = "Qwen3.5-9B"
+
+
+def _add_vlm_args(p):
+    """Add --vlm_service / --vlm_base_url / --vlm_api_key (env-overridable)."""
+    p.add_argument("--vlm_service",
+                   default=os.environ.get("VLM_SERVICE", "gemini"),
+                   choices=["gemini", "openai"],
+                   help="Policy VLM backend: 'gemini' (google.generativeai) or "
+                        "'openai' (OpenAI /v1/chat/completions, e.g. a local "
+                        "Qwen server). Env: VLM_SERVICE")
+    p.add_argument("--vlm_base_url",
+                   default=os.environ.get("VLM_BASE_URL", "http://localhost:23333/v1"),
+                   help="Base URL for --vlm_service openai (default: "
+                        "http://localhost:23333/v1). Env: VLM_BASE_URL")
+    p.add_argument("--vlm_api_key",
+                   default=os.environ.get("VLM_API_KEY"),
+                   help="Bearer token for --vlm_service openai (optional). "
+                        "Env: VLM_API_KEY")
+
+
+def _normalize_vlm_args(args):
+    """When using the openai backend, swap the gemini default model for the
+    local default unless the user explicitly passed --vlm_model."""
+    if getattr(args, "vlm_service", "gemini") == "openai" \
+            and args.vlm_model == _GEMINI_DEFAULT_MODEL:
+        args.vlm_model = _OPENAI_DEFAULT_MODEL
+    return args
+
+
+# ── VLM client factory ────────────────────────────────────────────────────────
+
+def _build_vlm_client(args, log_dir: str):
+    """Construct the policy VLM client based on --vlm_service.
+
+    gemini  → agent.gemini_client.GeminiClient (google.generativeai)
+    openai  → agent.openai_client.OpenAIClient (OpenAI /v1/chat/completions,
+              e.g. a locally-served Qwen at http://localhost:23333/v1)
+    """
+    service = getattr(args, "vlm_service", "gemini")
+    if service == "openai":
+        from agent.openai_client import OpenAIClient
+        base_url = getattr(args, "vlm_base_url", "http://localhost:23333/v1")
+        print(f"[VLM] backend=openai  model={args.vlm_model}  endpoint={base_url}  "
+              f"→ ALL policy/inspect/rerank calls use this local VLM", flush=True)
+        return OpenAIClient(
+            base_url   = base_url,
+            model_name = args.vlm_model,
+            api_key    = getattr(args, "vlm_api_key", None),
+            log_dir    = log_dir,
+        )
+    print(f"[VLM] backend=gemini  model={args.vlm_model}  "
+          f"→ ALL policy/inspect/rerank calls use Gemini", flush=True)
+    from agent.gemini_client import GeminiClient
+    return GeminiClient(
+        api_key    = args.gemini_api_key,
+        model_name = args.vlm_model,
+        log_dir    = log_dir,
+    )
+
+
+def _warm_protobuf_main_thread():
+    """Initialise protobuf's C extension on the MAIN thread.
+
+    The EmbeddingWorker loads its SigLIP tokenizer on a background thread, which
+    is the first code to import protobuf (via sentencepiece_model_pb2). Loading
+    protobuf's C extension for the first time off the main thread — concurrently
+    with PIL/pygame — segfaults (pygame_parachute). With the Gemini backend this
+    was masked because google.generativeai imported protobuf on the main thread
+    first; the OpenAI backend never imports it, so do it explicitly here. Cheap
+    and idempotent, so we always run it regardless of --vlm_service.
+    """
+    try:
+        import google.protobuf.descriptor_pool  # noqa: F401  (init C ext)
+        import sentencepiece  # noqa: F401
+    except Exception as exc:  # pragma: no cover - best-effort warmup
+        print(f"[warmup] protobuf/sentencepiece preload skipped: {exc}", flush=True)
+
+
 # ── Per-episode runner ────────────────────────────────────────────────────────
 
 def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
-    from agent.gemini_client import GeminiClient
     from agent.prompt_agent import PromptEmbodiedAgent
     from agent.episodic_memory import EpisodicMemory
     from memory.embedding import EmbeddingWorker
@@ -234,12 +316,28 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
     index_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Workers ───────────────────────────────────────────────────────────────
+    # Must run BEFORE EmbeddingWorker starts its background extractor thread.
+    _warm_protobuf_main_thread()
     embedding_worker = EmbeddingWorker(
         index_dir  = str(index_dir),
         model_name = args.retrieval_model,
         device     = "auto",
     )
     episodic_memory = EpisodicMemory(memory_dir=str(memory_dir))
+
+    # Block until the embedding worker has finished loading its extractor (which
+    # initialises a CUDA context on its background thread) BEFORE habitat-sim
+    # creates its GL/EGL context on the main thread. Two threads initialising GPU
+    # contexts simultaneously segfaults the NVIDIA driver (manifests as a crash
+    # inside habitat_sim _config_backend). Serialising them here removes the
+    # race. Bounded wait: on extractor-load failure _ready is never set, so we
+    # fall through after the timeout rather than hang.
+    _t0 = time.time()
+    while not embedding_worker.is_ready and (time.time() - _t0) < 180.0:
+        time.sleep(0.1)
+    if not embedding_worker.is_ready:
+        print("[run_owmm_embodied] WARNING: embedding extractor not ready after "
+              "180s; continuing (retrieval may be degraded)", flush=True)
 
     # ── Habitat env ───────────────────────────────────────────────────────────
     # Hydra config search paths are relative to habitat-lab's working dir
@@ -264,11 +362,7 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
     print(f"\n[ep {ep_id}] task: {task_text!r}", flush=True)
 
     # ── Agent ─────────────────────────────────────────────────────────────────
-    gemini_client = GeminiClient(
-        api_key    = args.gemini_api_key,
-        model_name = args.vlm_model,
-        log_dir    = str(log_dir),
-    )
+    gemini_client = _build_vlm_client(args, str(log_dir))
 
     # GroundingDINO for sharp open-set bounding boxes (used by object
     # localization); falls back to Gemini `inspect` if unavailable.
@@ -304,10 +398,10 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
             embedding_worker = embedding_worker,
             episodic_memory  = episodic_memory,
             episode_id       = str(ep_id),
-            max_iters        = getattr(args, "explore_iters", 12),
-            lam              = getattr(args, "explore_lambda", 2.0),
-            max_range        = getattr(args, "explore_range", 5.0),
-            min_gain         = getattr(args, "explore_min_gain", 4),
+            max_iters        = getattr(args, "explore_iters", 40),
+            lam              = getattr(args, "explore_lambda", 0.5),
+            max_range        = getattr(args, "explore_range", 1.5),
+            min_gain         = getattr(args, "explore_min_gain", 1),
             drive            = not getattr(args, "explore_teleport", False),
             video_path       = (str(capture_dir / "explore.mp4")
                                  if getattr(args, "explore_video", False) else None),
@@ -396,8 +490,7 @@ def _build_args():
     p.add_argument("--vlm_model", default="models/gemini-3.5-flash",
                    help="Gemini model ID (default: models/gemini-3.5-flash)")
     p.add_argument("--gemini_api_key",
-                   default=os.environ.get("GEMINI_API_KEY",
-                                          "AIzaSyANuL-0kA_-dsRjVivbhWhZWi2HuSRB7X4"))
+                   default=os.environ.get("GEMINI_API_KEY", ""))
     p.add_argument("--retrieval_model", default="siglip_base",
                    help="Vision model for FAISS retrieval (siglip_base, dinov2_base)")
     p.add_argument("--scan_points", type=int, default=8, metavar="N",
@@ -419,7 +512,8 @@ def _build_args():
     p.add_argument("--no_gdino", action="store_true",
                    help="Disable GroundingDINO object localization (use Gemini "
                         "inspect for bounding boxes instead)")
-    return p.parse_args()
+    _add_vlm_args(p)
+    return _normalize_vlm_args(p.parse_args())
 
 
 def main():

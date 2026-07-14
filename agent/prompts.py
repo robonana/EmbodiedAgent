@@ -20,8 +20,7 @@ Complete the user task by calling exactly one tool per step.
 
 CAMERAS:
 - Head camera (forward-facing): your main view of the scene; use it for navigation, finding objects, and placement.
-- Wrist/gripper camera (mounted on the arm, looks at the end-effector): use it to judge whether an object is actually grasped or held. The head camera CANNOT see the gripper, so rely on the wrist view to confirm grasps.
-Both views are attached each step when available.
+After a grasp attempt, the tool result reports the ground-truth grasp state (whether an object is actually held), so you do not need to judge grasp success from the image.
 
 OUTPUT RULES:
 - You may first reason inside <think>...</think> tags. This is encouraged for complex decisions.
@@ -60,8 +59,8 @@ AVAILABLE TOOLS:
 
     Arguments:
     image_path: path to a single image file
-    image_paths: optional list of image paths to inspect together (e.g. head + wrist
-        views, or several memory candidates). Use this instead of image_path to compare
+    image_paths: optional list of image paths to inspect together (e.g. several
+        memory candidates). Use this instead of image_path to compare
         or reason across multiple images in one call.
     question: visual question to answer
     bbox: optional [x1,y1,x2,y2] or list of boxes in 512×512 pixel coordinates.
@@ -79,6 +78,7 @@ AVAILABLE TOOLS:
     The question is not visual.
 
     Rules:
+    Do not guess bbox coordinates; use the bboxes returned by the detect tool.
     Use multiple bboxes in one call when several candidate regions are possible.
     Avoid redundant or overlapping bboxes.
     inspect only answers visual questions; it does not move or manipulate.
@@ -359,8 +359,8 @@ PREVIOUS ACTION VERIFICATION RULES:
 - previous_action_verification is mandatory and must be the first JSON field.
 - Start its value with the exact phrase "Previous action verification:".
 - At the first step, write "Previous action verification: no previous action yet."
-- Otherwise, verify whether the previous action achieved its expected_progress using the current head image, wrist/gripper image when relevant, robot state, and last tool result.
-- For grasp/hold checks, rely on the wrist/gripper image when available; the head camera usually cannot see the gripper.
+- Otherwise, verify whether the previous action achieved its expected_progress using the current head image, robot state, and last tool result.
+- For grasp/hold checks, use the ground-truth grasp state reported in the last tool result (fields "grasped"/"held_object").
 - State one of succeeded, failed, or uncertain, plus brief observable evidence.
 - Use this verification to decide the next tool. If the previous action failed or is uncertain, choose a recovery action or gather more evidence instead of assuming success.
 
@@ -419,18 +419,13 @@ def build_policy_prompt(
     lines += ["", "CURRENT ROBOT STATE:"]
     lines.append(f"  pose: {obs.get('robot_pose', 'unknown')}")
 
-    # ── Current image(s) ──────────────────────────────────────────────────────
+    # ── Current image ─────────────────────────────────────────────────────────
     img_path   = obs.get("image_path", "")
-    wrist_path = obs.get("wrist_image_path")
     if img_path:
         lines += ["", f"CURRENT HEAD-CAMERA IMAGE (forward-facing): {img_path}  "
                       f"[attached — examine carefully]"]
     else:
         lines += ["", "CURRENT HEAD-CAMERA IMAGE: [attached — examine carefully]"]
-    if wrist_path:
-        lines += [f"CURRENT WRIST/GRIPPER-CAMERA IMAGE: {wrist_path}  "
-                  f"[attached — shows the end-effector; use it to judge whether an "
-                  f"object is grasped/held]"]
 
     # ── Episode transient memory ──────────────────────────────────────────────
     lines += [""]

@@ -114,11 +114,6 @@ class BaseToolbox(ABC):
         self._last_obs:        Optional[dict]       = None
         self._last_rgb:        Optional[np.ndarray] = None
         self._last_image_path: Optional[str]        = None
-        # Wrist / gripper camera (looks at the end-effector). Lets the VLM judge
-        # whether an object is actually grasped — the forward head camera cannot
-        # see the gripper. None on backends without a wrist camera.
-        self._last_wrist_rgb:        Optional[np.ndarray] = None
-        self._last_wrist_image_path: Optional[str]        = None
         self._step_counter:    int                  = 0
 
         for sub in ("images", "crops"):
@@ -138,11 +133,14 @@ class BaseToolbox(ABC):
     def _capture_rgb(self, obs: dict) -> Optional[np.ndarray]:
         """Extract RGB ndarray (H,W,3 uint8) from obs, or None."""
 
-    def _capture_wrist_rgb(self, obs: dict) -> Optional[np.ndarray]:
-        """Extract wrist/gripper-camera RGB (H,W,3 uint8) from obs, or None.
+    def _grasp_state(self) -> Optional[dict]:
+        """Ground-truth grasp state, or None if the backend cannot introspect it.
 
-        Default: no wrist camera. Backends with an arm-mounted camera override
-        this so observe() can attach a gripper view to the VLM observation.
+        Returns ``{"grasped": bool, "object": Optional[str]}`` where ``grasped``
+        is whether the gripper is holding anything and ``object`` is the handle
+        of the held object (if known). Sim backends override this from the
+        physics grasp manager; real-robot/MCP backends without a reliable held
+        signal return None so the policy falls back to visual judgment.
         """
         return None
 
@@ -241,25 +239,12 @@ class BaseToolbox(ABC):
             self._last_rgb        = rgb
             self._last_image_path = img_path
 
-            # Wrist / gripper camera (if the backend exposes one). Saved with the
-            # SAME step counter as the head frame so the pair is easy to align.
-            wrist_rgb  = self._capture_wrist_rgb(obs)
-            wrist_path = None
-            if wrist_rgb is not None:
-                wrist_path = self._save_companion_frame(wrist_rgb, "wrist")
-            self._last_wrist_rgb        = wrist_rgb
-            self._last_wrist_image_path = wrist_path
-
             pose    = self._get_robot_pose()
             summary = f"Camera captured. pose={self._pose_str(pose)}"
-            if wrist_path:
-                summary += " (+ wrist view)"
-            image_paths = [img_path] + ([wrist_path] if wrist_path else [])
             return ToolResult(
                 ok=True, tool="observe", summary=summary,
-                data={"robot_pose": pose, "image_path": img_path,
-                      "wrist_image_path": wrist_path},
-                image_paths=image_paths,
+                data={"robot_pose": pose, "image_path": img_path},
+                image_paths=[img_path],
             )
         except Exception as e:
             return ToolResult(ok=False, tool="observe",
@@ -805,16 +790,29 @@ class BaseToolbox(ABC):
                                   summary=f"Could not localize '{target}' to grasp.",
                                   data={"skill": skill})
 
-            # A grasp was attempted on a real target. The tool does NOT judge
-            # whether the object ended up held — the verify step decides that
-            # from the next observation, so report neutrally and attach the
-            # fresh frame for it to inspect.
+            # A grasp was attempted on a real target. Query the backend's
+            # ground-truth grasp state and report it directly so the policy does
+            # not have to infer success from the image.
             self._post_manipulate()   # retract the arm regardless of outcome
             obs_result = self.observe()
+            gstate    = self._grasp_state()
+            grasped   = gstate.get("grasped") if gstate else None
+            held_obj  = gstate.get("object")  if gstate else None
+            if grasped is True:
+                held_str = f" (holding '{held_obj}')" if held_obj else ""
+                summary  = f"Grasp on {obj_name} SUCCEEDED: object is held{held_str}."
+            elif grasped is False:
+                summary  = f"Grasp on {obj_name} FAILED: gripper is empty (no object held)."
+            else:
+                summary  = f"Grasp attempted on {obj_name} (grasp state unknown)."
             return ToolResult(
-                ok=True, tool="manipulate",
-                summary=f"Grasp attempted on {obj_name}.",
-                data={"skill": skill, "object": obj_name, "distance": dist},
+                # When ground truth is available, ok reflects the actual grasp
+                # outcome; otherwise stay neutral (attempt made) and defer.
+                ok=(grasped is not False),
+                tool="manipulate",
+                summary=summary,
+                data={"skill": skill, "object": obj_name, "distance": dist,
+                      "grasped": grasped, "held_object": held_obj},
                 image_paths=obs_result.image_paths,
             )
 
@@ -1040,8 +1038,8 @@ class BaseToolbox(ABC):
         return path
 
     def _save_companion_frame(self, rgb: np.ndarray, tag: str) -> str:
-        """Save an extra frame for the CURRENT step (e.g. the wrist view) without
-        advancing the step counter, so it pairs with the head frame just saved."""
+        """Save an extra frame for the CURRENT step without advancing the step
+        counter, so it pairs with the head frame just saved."""
         from PIL import Image as _PIL
         path = str(self.log_dir / "images" / f"{self._step_counter:04d}_{tag}.png")
         _PIL.fromarray(rgb).save(path)

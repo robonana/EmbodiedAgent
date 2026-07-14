@@ -237,19 +237,26 @@ class HabitatToolbox(BaseToolbox):
             if cam_info is None:
                 return
 
-            # In Fetch's gripper frame +X points toward the fingertips and ±Z is
-            # the lateral (side) axis. Mount on the OPPOSITE side of the
-            # end-effector (Z = -0.11, was +0.11), slightly behind the palm, and
-            # aim back across the gripper (look_at Z = +0.03) so the gripper
-            # stays visible from this side.
-            cam_info.cam_offset_pos = mn.Vector3(-0.06, 0.00, -0.11)
-            cam_info.cam_look_at_pos = mn.Vector3(0.32, 0.00, 0.03)
-            # Roll the image 90° clockwise about the camera's optical axis. The
-            # look_at transform makes the camera look down local -Z, so the roll
-            # axis is +Z; +90° rolls the image clockwise (flip to -90 for CCW).
+            # Camera-link frame (link 22, rigid to the gripper): +X → fingertips,
+            # +Y → up, ±Z → lateral. The end-effector measures at ~(0.08, 0, 0)
+            # in this frame for ANY arm pose (see tools/wrist_cam_diag.py).
+            # The two fingers measure at l=(0.08,-0.04,0) and r=(0.08,0.056,0) in
+            # this frame — they separate along the gripper's Y (open/close) axis,
+            # finger length along +X. So a pure top-down view looks straight DOWN
+            # that separation axis and the near finger hides the far one (only one
+            # visible). To show BOTH fingers + the gap, look ACROSS them along Z.
+            # "s_up_r90" mount (tuned via tools/tune_wrist_cam.py with the
+            # production-faithful configure-at-tucked→view-at-reach flow): camera
+            # to the +Z side and elevated (+Y) for a top-ish angle, looking at the
+            # finger center (0.08, 0.008, 0); roll 90 lays the two fingers
+            # side-by-side. Shows both fingers empty AND a held object between them.
+            cam_info.cam_offset_pos  = mn.Vector3(0.07, 0.09, 0.10)
+            cam_info.cam_look_at_pos = mn.Vector3(0.08, 0.008, 0.00)
             cam_info.relative_transform = mn.Matrix4.rotation_z(mn.Deg(90.0))
             robot.update()
-            print("[camera] articulated_agent_arm_rgb aimed at gripper", flush=True)
+            print("[camera] articulated_agent_arm_rgb: elevated cross-finger view "
+                  "(offset 0.07,0.09,0.10 look_at 0.08,0.008,0 roll 90) — both "
+                  "fingers visible", flush=True)
         except Exception as exc:
             print(f"[camera] gripper camera pose override skipped: {exc}", flush=True)
 
@@ -385,7 +392,7 @@ class HabitatToolbox(BaseToolbox):
             self._live_navcap = None
 
     def _show_frame(self, obs: dict, pause: bool = False) -> None:
-        """Display camera images via pygame: third-person, head, wrist."""
+        """Display camera images via pygame: third-person, head."""
         if _RECORD_THIRD_PERSON:
             self._record_third_person_frame(obs)
         if not _RENDER:
@@ -394,8 +401,6 @@ class HabitatToolbox(BaseToolbox):
             panel_slots = (
                 ("third_person_sensor",),
                 ("head_rgb", "agent_0_head_rgb"),
-                ("articulated_agent_arm_rgb",
-                 "agent_0_articulated_agent_arm_rgb"),
             )
             panels = []
             TARGET_H = 512
@@ -470,23 +475,27 @@ class HabitatToolbox(BaseToolbox):
 
         return None
 
-    def _capture_wrist_rgb(self, obs: dict) -> Optional[np.ndarray]:
-        """Return the arm-mounted (wrist/gripper) camera RGB, or None.
+    def _grasp_state(self) -> Optional[dict]:
+        """Ground-truth grasp state from Habitat's magic-grasp manager.
 
-        Fetch's `articulated_agent_arm_rgb` sensor is mounted on the arm and
-        looks at the gripper workspace, so it shows whether an object is
-        actually held — the forward head camera never sees the end-effector.
-        The arm_workspace_rgb sensor is a head view with a reachability overlay
-        (NOT a gripper view), so it is intentionally excluded here.
+        ``grasp_mgr.snap_idx`` is the rigid-object id currently constrained to
+        the gripper (None when the hand is empty). This is the physics truth of
+        whether an object is held, so the policy never has to infer it visually.
         """
-        for key in ("articulated_agent_arm_rgb", "agent_0_articulated_agent_arm_rgb"):
-            rgb = obs.get(key)
-            if rgb is None:
-                continue
-            arr = np.asarray(rgb)
-            if arr.ndim == 3 and arr.shape[2] >= 3:
-                return arr[..., :3].astype(np.uint8)
-        return None
+        try:
+            gm = self._sim.grasp_mgr
+        except Exception:
+            return None
+        idx = getattr(gm, "snap_idx", None)
+        if idx is None:
+            return {"grasped": False, "object": None}
+        name = None
+        try:
+            obj = self._sim.get_rigid_object_manager().get_object_by_id(idx)
+            name = obj.handle if obj is not None else None
+        except Exception:
+            pass
+        return {"grasped": True, "object": name}
 
     def _get_robot_pose(self) -> list[float]:
         """
@@ -1608,12 +1617,12 @@ class HabitatToolbox(BaseToolbox):
         embedding_worker,
         episodic_memory,
         episode_id: str = "",
-        max_iters: int = 12,
+        max_iters: int = 40,
         res: float = 0.10,
-        max_range: float = 4.0,
-        lam: float = 2.0,
+        max_range: float = 1.5,
+        lam: float = 0.5,
         gain_radius: float = 3.0,
-        min_gain: int = 4,
+        min_gain: int = 1,
         max_candidates: int = 60,
         drive: bool = True,
         video_path: Optional[str] = None,

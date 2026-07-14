@@ -205,22 +205,27 @@ def _build_args():
     p.add_argument("--gpu_id", type=int, default=0)
     p.add_argument("--vlm_model", default="models/gemini-3.5-flash")
     p.add_argument("--gemini_api_key",
-                   default=os.environ.get("GEMINI_API_KEY",
-                                          "AIzaSyANuL-0kA_-dsRjVivbhWhZWi2HuSRB7X4"))
+                   default=os.environ.get("GEMINI_API_KEY", ""))
     p.add_argument("--retrieval_model", default="siglip_base")
     p.add_argument("--scan_points", type=int, default=8)
     p.add_argument("--no_scan", action="store_true")
     p.add_argument("--explore", action="store_true",
                    help="Use frontier-based exploration to build scene memory "
                         "instead of the random-point scan")
-    p.add_argument("--explore_iters", type=int, default=12,
-                   help="Max frontier viewpoints to visit (default: 12)")
-    p.add_argument("--explore_lambda", type=float, default=2.0,
-                   help="Travel-cost weight in score=cluster_size-λ·cost (default: 2.0)")
-    p.add_argument("--explore_range", type=float, default=5.0,
-                   help="Max depth range fused into the occupancy map, m (default: 5.0)")
-    p.add_argument("--explore_min_gain", type=int, default=4,
-                   help="Stop when best frontier-cluster score < this (default: 4)")
+    p.add_argument("--explore_iters", type=int, default=40,
+                   help="Max frontier viewpoints to visit (default: 40)")
+    p.add_argument("--explore_lambda", type=float, default=0.5,
+                   help="Travel-cost weight in score=cluster_size-λ·cost (default: 0.5). "
+                        "Lower ⇒ distant frontiers stay worth visiting, so the robot "
+                        "keeps exploring to full coverage instead of stopping early.")
+    p.add_argument("--explore_range", type=float, default=1.5,
+                   help="Max depth range fused into the occupancy map, m (default: 1.5). "
+                        "Smaller ⇒ the robot must drive closer to objects to map them; "
+                        "larger ⇒ it maps the scene from farther away.")
+    p.add_argument("--explore_min_gain", type=int, default=1,
+                   help="Stop when best frontier-cluster score < this (default: 1). "
+                        "Lower ⇒ keep visiting small remaining frontiers for fuller "
+                        "coverage.")
     p.add_argument("--explore_teleport", action="store_true",
                    help="Teleport between frontier viewpoints (fast) instead of "
                         "the default continuous oracle-nav driving")
@@ -242,7 +247,8 @@ def _build_args():
     p.add_argument("--no_gdino", action="store_true",
                    help="Disable GroundingDINO object localization (use Gemini "
                         "inspect for bounding boxes instead)")
-    return p.parse_args()
+    base._add_vlm_args(p)
+    return base._normalize_vlm_args(p.parse_args())
 
 
 def main():

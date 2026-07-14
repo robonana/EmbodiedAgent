@@ -141,7 +141,10 @@ def infer_progress_from_tool_result(
     if tool == "manipulate":
         skill = result_data.get("skill", "")
         if skill == "grasp":
-            return None  # next policy response must verify grasp success from observation
+            grasped = result_data.get("grasped")
+            if grasped is not None:
+                return bool(grasped)  # ground-truth grasp state from the backend
+            return None  # backend can't introspect; policy verifies from observation
         return result_ok
 
     return None

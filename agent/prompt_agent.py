@@ -144,16 +144,6 @@ class PromptEmbodiedAgent:
                     f"Current head-camera observation (forward-facing) ({obs_path}):",
                     obs_path))
                 attached.add(obs_path)
-            # Wrist/gripper camera (mounted on the arm, looks at the end-effector).
-            # Lets the policy see whether an object is actually grasped — the head
-            # camera never sees the gripper.
-            wrist_path = getattr(self.toolbox, "_last_wrist_image_path", None)
-            if wrist_path and os.path.exists(wrist_path):
-                labeled_images.append((
-                    f"Current wrist/gripper-camera view (shows the end-effector) "
-                    f"({wrist_path}):",
-                    wrist_path))
-                attached.add(wrist_path)
             if last_result and last_result.image_paths:
                 # Map each candidate image path → its memory_id so the policy sees
                 # that e.g. the file "000034.png" IS memory mem_000034 (the navigate
@@ -181,8 +171,10 @@ class PromptEmbodiedAgent:
                         labeled_images.append((label, p))
                         attached.add(p)
 
-            # ── Call Gemini policy ────────────────────────────────────────────
-            print(f"  [Gemini] calling policy (images={len(labeled_images)})")
+            # ── Call VLM policy ───────────────────────────────────────────────
+            _vlm = type(self.gemini).__name__
+            print(f"  [VLM] {_vlm} model={self.gemini.model_name} "
+                  f"calling policy (images={len(labeled_images)})")
             raw_response_dict = self.gemini.call_policy(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_prompt,
@@ -194,10 +186,10 @@ class PromptEmbodiedAgent:
 
             # ── Parse action ─────────────────────────────────────────────────
             if not raw_response_dict or "tool" not in raw_response_dict:
-                print(f"  [PromptAgent] Gemini returned no valid action at step "
-                      f"{step_idx + 1}")
+                print(f"  [PromptAgent] {self.gemini.model_name} returned no valid "
+                      f"action at step {step_idx + 1}")
                 action = ToolAction(
-                    rationale="Gemini returned no valid JSON; waiting one step.",
+                    rationale="VLM returned no valid JSON; waiting one step.",
                     tool="wait",
                     arguments={"seconds": 1},
                     previous_action_verification=(
