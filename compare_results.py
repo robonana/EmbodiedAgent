@@ -12,6 +12,14 @@ Usage:
     python compare_results.py
     python compare_results.py --embodied runs/owmm_embodied/results.csv \\
                               --owmm     OWMM-Agent/sim/habitat-lab/eval_in_sim_info/sat_TEST_YCB_30scene_head_rgb
+
+The two frameworks report the same underlying Habitat metrics but in completely different
+formats — ours in a CSV column-per-metric, theirs scraped out of human-readable text logs, one
+directory per episode. Most of this file is reconciling those two shapes into one table.
+
+Naming gotcha that runs through the whole module: our CSV prefixes Habitat's metrics with
+`hab_` (e.g. hab_pddl_success) while OWMM's logs do not (pddl_success). The _avg() fallback
+mechanism exists purely to paper over that, and the per-episode table hard-codes both spellings.
 """
 from __future__ import annotations
 
@@ -30,7 +38,17 @@ _HERE = Path(__file__).resolve().parent
 # ── OWMM-Agent log parsing ────────────────────────────────────────────────────
 
 def _parse_owmm_log(output_log: Path) -> Optional[Dict]:
-    """Parse a single OWMM-Agent episode output.log → metric dict."""
+    """Parse a single OWMM-Agent episode output.log → metric dict.
+
+    OWMM emits no machine-readable results file, so we scrape its console log for lines of the
+    form "Average episode <metric>: <value>". Each episode's log lives in a directory NAMED
+    for its episode id, which is the only place that id appears — hence recovering it from the
+    parent directory name.
+
+    errors="replace" because these logs contain progress bars and terminal escapes that are
+    not always valid UTF-8. Returns None when nothing parsed, so a crashed episode's log is
+    skipped rather than counted as a zero.
+    """
     if not output_log.exists():
         return None
     text = output_log.read_text(errors="replace")
@@ -38,6 +56,8 @@ def _parse_owmm_log(output_log: Path) -> Optional[Dict]:
     for line in text.splitlines():
         m = re.search(r"Average episode (\S+):\s+([\d.]+)", line)
         if m:
+            # Later lines win — the log prints running averages, so the final one is the
+            # episode's actual result.
             metrics[m.group(1)] = float(m.group(2))
     if not metrics:
         return None
@@ -46,13 +66,17 @@ def _parse_owmm_log(output_log: Path) -> Optional[Dict]:
     try:
         ep_id = int(ep_id)
     except ValueError:
-        pass
+        pass   # non-numeric directory name — keep it as a string, it still joins fine
     metrics["episode_id"] = ep_id
     return metrics
 
 
 def _load_owmm_results(owmm_dir: Path) -> List[Dict]:
-    """Walk OWMM eval directory and collect per-episode metrics."""
+    """Walk OWMM eval directory and collect per-episode metrics.
+
+    Missing directory is a warning, not an error: comparing against nothing still prints our
+    own numbers, which is often all you want.
+    """
     records = []
     if not owmm_dir.exists():
         print(f"[compare] OWMM eval dir not found: {owmm_dir}")
@@ -80,11 +104,22 @@ def _load_embodied_results(csv_path: Path) -> List[Dict]:
 # ── Aggregation ───────────────────────────────────────────────────────────────
 
 def _aggregate(records: List[Dict], framework: str) -> Dict:
+    """Mean of each metric across one framework's episodes.
+
+    Because success metrics are 0/1 per episode, their mean IS the success rate — which is why
+    the same _avg() serves both the rate rows and the step-count rows in the table.
+    """
     recs = [r for r in records if r.get("framework") == framework or not r.get("framework")]
     if not recs:
         return {"framework": framework, "n": 0}
 
     def _avg(key, fallback_keys=()):
+        """Mean over episodes that HAVE this metric, trying the fallback spellings.
+
+        The fallbacks are the hab_-prefix reconciliation (see the module docstring). Values
+        that are missing or unparseable are skipped rather than treated as 0 — a metric an
+        episode never reported must not drag the average down.
+        """
         vals = []
         for r in recs:
             v = r.get(key)
@@ -94,12 +129,16 @@ def _aggregate(records: List[Dict], framework: str) -> Dict:
                     if v is not None:
                         break
             try:
+                # CSV values arrive as strings; OWMM's arrive as floats. float() handles both.
                 vals.append(float(v))
             except (TypeError, ValueError):
                 pass
-        return sum(vals) / len(vals) if vals else None
+        return sum(vals) / len(vals) if vals else None   # None ⇒ printed as "—"
 
     n = len(recs)
+    # The three stages are OVMM's decomposition of the task: reach the object, pick it up,
+    # reach the goal. They are the most useful rows in the table — they say WHERE a failing
+    # agent is failing, which the single success rate cannot.
     return {
         "framework"         : framework,
         "n"                 : n,
@@ -119,6 +158,11 @@ def _aggregate(records: List[Dict], framework: str) -> Dict:
 # ── Pretty print ──────────────────────────────────────────────────────────────
 
 def _fmt(val, pct=False, decimals=2):
+    """Format a metric, rendering a missing value as an em-dash rather than 0.
+
+    The distinction matters when reading the table: "—" means the framework never reported
+    this metric, whereas "0.0%" means it reported it and failed every episode.
+    """
     if val is None:
         return "  —  "
     if pct:
@@ -150,6 +194,12 @@ def _print_comparison(owmm: Dict, embodied: Dict, owmm_model: str, emb_model: st
 # ── Per-episode breakdown ─────────────────────────────────────────────────────
 
 def _per_episode_table(owmm_recs: List[Dict], emb_recs: List[Dict]):
+    """Side-by-side per-episode outcomes — an OUTER join, so episodes only one framework ran
+    still appear (with "—" on the other side).
+
+    Keyed on the id as a STRING, since OWMM's may have failed to parse as an int. The sort key
+    then restores numeric ordering where it can, so ep 10 doesn't sort before ep 2.
+    """
     owmm_by_ep = {str(r.get("episode_id", "")): r for r in owmm_recs}
     emb_by_ep  = {str(r.get("episode_id", "")): r for r in emb_recs}
     all_eps    = sorted(set(owmm_by_ep) | set(emb_by_ep), key=lambda x: int(x) if x.isdigit() else x)
@@ -160,6 +210,8 @@ def _per_episode_table(owmm_recs: List[Dict], emb_recs: List[Dict]):
     print("\n── Per-Episode Breakdown ────────────────────────────────────────")
     print(f"  {'ep_id':<8}  {'OWMM pddl':<12}  {'Emb pddl':<12}  {'OWMM steps':<12}  {'Emb steps':<12}")
     print("  " + "─" * 60)
+    # Note the asymmetric key names on each side (pddl_success vs hab_pddl_success) — the
+    # hab_-prefix difference described in the module docstring, hard-coded here.
     for ep in all_eps:
         o = owmm_by_ep.get(ep, {})
         e = emb_by_ep.get(ep, {})
@@ -206,11 +258,14 @@ def main():
     if args.per_episode:
         _per_episode_table(owmm_recs, emb_recs)
 
-    # Save merged CSV
+    # Save merged CSV — both frameworks' raw records in one file, distinguished by the
+    # `framework` column, for further analysis elsewhere.
     all_recs = owmm_recs + emb_recs
     if all_recs:
         out_csv = _HERE / "runs" / "comparison.csv"
         out_csv.parent.mkdir(parents=True, exist_ok=True)
+        # Union of every key across both frameworks (they report different metric sets), so
+        # no column is dropped. DictWriter fills absent keys with "".
         fieldnames = sorted({k for r in all_recs for k in r})
         with out_csv.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

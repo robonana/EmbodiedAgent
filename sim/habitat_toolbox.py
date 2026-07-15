@@ -16,6 +16,22 @@ Camera convention (Habitat depth sensor)
 Camera space: X right, Y down, Z forward-into-scene but depth is positive along +Z_cam.
 Habitat uses -Z_cam convention (point in front → z_cam = -depth).  The depth_rot /
 depth_trans sensors expose the camera-to-world 3 × 3 rotation and 3-D translation.
+
+Reading guide — this file has four fairly independent parts:
+
+  1. Module constants (below): the thresholds that decide when a grasp/place is allowed to
+     fire. These are the numbers you actually tune when manipulation misbehaves.
+  2. The pygame display plumbing: a subprocess, for a non-obvious reason documented there.
+  3. HabitatToolbox itself: the BaseToolbox primitives (_step, _get_robot_pose, _grasp, …)
+     re-implemented against habitat.Env.
+  4. Overrides of the *high-level* tools — navigate() in particular, which does NOT use
+     BaseToolbox's pure-pursuit loop but delegates to Habitat's oracle_nav_coord_action, so
+     that this backend's navigation is identical to OWMM-Agent's and the comparison is fair.
+
+The single biggest source of confusion here is the coordinate mismatch spelled out above:
+Habitat is Y-up, so the floor plane is XZ, while BaseToolbox's generic code assumes the
+floor is XY. Every pose crossing that boundary is remapped ([x, z, yaw] ⇄ [X, Y_floor, Z]),
+and the remapping is easy to get subtly wrong.
 """
 
 from __future__ import annotations
@@ -31,26 +47,47 @@ import numpy as np
 from agent.toolbox_base import BaseToolbox
 from agent.schemas import ToolResult
 
+# ── Manipulation thresholds ──────────────────────────────────────────────────
+# These govern when a grasp or place is permitted to succeed. They are the knobs to reach
+# for first when the arm is "almost" working: too tight and the agent can never grasp
+# anything, too loose and it grasps through walls.
+
 # OWMM-style IK-reach pick: max arm steps and how close the end-effector must
 # get to the *target* object before the magic-grasp snap is allowed.
-_ARM_MAX_STEPS      = 90
+_ARM_MAX_STEPS      = 90     # watchdog: give up if IK can't converge in this many steps
 _GRASP_REACH_THRESH = 0.12   # metres (EE → target object centre)
+# When a grasp ray hits the receptacle under a small object, snap to a pickable
+# scene object within this radius of the hit point (see _raycast_pixel_to_object).
+# Horizontal radius is tight (honesty); vertical is looser since objects rest ABOVE
+# the surface the ray lands on. Override via GRASP_SNAP_RADIUS to tune.
+_GRASP_SNAP_RADIUS   = float(os.environ.get("GRASP_SNAP_RADIUS", "0.30"))   # metres, horizontal
+_GRASP_SNAP_RADIUS_Y = float(os.environ.get("GRASP_SNAP_RADIUS_Y", "0.45")) # metres, vertical
 # Suction: start closing the gripper once the EE is this close to the target so
 # the fingers actually engage (an open gripper straddles small objects without
 # ever touching them → no contact → no grasp).
 _GRASP_CLOSE_DIST   = 0.18   # metres
 _PLACE_MAX_STEPS    = 90
+# Looser than the grasp threshold (0.20 vs 0.12 m): a receptacle is a large surface and the
+# target point is only an estimate of somewhere on it, whereas a grasp has to hit a specific
+# small object.
 _PLACE_REACH_THRESH = 0.20   # metres (EE → visible receptacle/top point)
+# After releasing, keep stepping so the object actually falls and comes to rest before the
+# next observation — otherwise the agent photographs it mid-air and mis-verifies the place.
 _PLACE_SETTLE_STEPS = 25
 # Arm retract after a manipulation: blend this fraction of the way from the
 # current pose toward the rest pose (0 = stay put, 1 = full tuck). Partial so
 # the arm just clears the workspace without folding all the way back.
 _ARM_RETRACT_FRAC = 0.4
-# Wall-clock seconds between live memory writes while the robot performs a task
+# Wall-clock seconds between live memory writes while the robot performs a task.
+# Rate-limits episodic-memory ingestion: the control loop runs far faster than this, and
+# indexing every frame would fill memory with near-duplicates.
 _LIVE_INGEST_INTERVAL = 3.0
 # Base velocity magnitudes for kinematic steps
 _FWD_VEL   = 0.25       # m/s forward speed for base_velocity
 _TURN_VEL  = 0.5        # rad/s turn speed
+# Turn-then-drive threshold: if the goal is more than 20° off the nose, rotate in place
+# rather than arcing toward it. (Wider than the ManiSkill backend's 8° — Habitat's velocity
+# controller arcs more gracefully, so it tolerates a larger error before a pure turn helps.)
 _ROT_THRESH = math.radians(20)   # steer-only threshold
 
 # ── pygame rendering (same env-var interface as OWMM-Agent) ──────────────────
@@ -58,8 +95,8 @@ _ROT_THRESH = math.radians(20)   # steer-only threshold
 # Ubuntu. Fix: run the pygame display in a forked subprocess launched BEFORE
 # habitat loads, communicating frames via multiprocessing.Queue.
 
-_RENDER = os.environ.get("HABITAT_RENDER", "0") == "1"
-_STEP   = os.environ.get("HABITAT_STEP",   "0") == "1"
+_RENDER = os.environ.get("HABITAT_RENDER", "0") == "1"   # show a live pygame window
+_STEP   = os.environ.get("HABITAT_STEP",   "0") == "1"   # pause for SPACE before each action
 _RECORD_THIRD_PERSON = os.environ.get("HABITAT_RECORD_THIRD_PERSON", "0") == "1"
 # Grasp model: "suction" = grab only once the gripper is in physics CONTACT
 # with the target (realistic trigger), seating it in the hand (force=True);
@@ -78,7 +115,12 @@ _display_proc:  Optional["_mp.Process"] = None
 
 
 def _display_worker(frame_q, ack_q):
-    """Runs in a separate process (no Habitat EGL — can safely use X11/pygame)."""
+    """Runs in a separate process (no Habitat EGL — can safely use X11/pygame).
+
+    Loop: pull a (frame, pause) tuple off the queue, blit it, and — if paused — block until
+    the user presses SPACE, then acknowledge on ack_q. The ack is what makes step-mode work:
+    the *main* process blocks reading ack_q, so the simulator genuinely waits for the human.
+    """
     import pygame
     screen = None
     while True:
@@ -88,17 +130,22 @@ def _display_worker(frame_q, ack_q):
                 pygame.quit()
             return
         frame, pause = item
+        # Lazily create (or recreate) the window: the frame size isn't known until the first
+        # frame arrives, and it changes if the third-person recorder is toggled on.
         if screen is None or screen.get_size() != (frame.shape[1], frame.shape[0]):
             pygame.init()
             screen = pygame.display.set_mode((frame.shape[1], frame.shape[0]))
             print("[pygame] window opened — SPACE to step, Q to quit", flush=True)
 
+        # Drain the event queue even when not pausing — an unpumped SDL window is marked
+        # unresponsive by the window manager and stops repainting.
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return
             if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
                 return
 
+        # numpy is (row, col) = (y, x); pygame surfaces are (x, y). Hence the transpose.
         surf = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
         screen.blit(surf, (0, 0))
         cap = "EmbodiedAgent  [SPACE to execute]" if pause else "EmbodiedAgent"
@@ -106,11 +153,13 @@ def _display_worker(frame_q, ack_q):
         pygame.display.flip()
 
         if pause:
+            # Block here until the user advances. The 20 ms sleep keeps this from spinning
+            # a core while waiting.
             waiting = True
             while waiting:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        ack_q.put("quit")
+                        ack_q.put("quit")   # tell the main process we're gone
                         return
                     if event.type == pygame.KEYDOWN:
                         if event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_RIGHT):
@@ -119,33 +168,45 @@ def _display_worker(frame_q, ack_q):
                             ack_q.put("quit")
                             return
                 threading.Event().wait(0.02)
-            ack_q.put("ok")
+            ack_q.put("ok")     # unblocks _pg_show in the main process
 
 
 def start_display_process():
-    """Launch the pygame display worker before habitat-sim is imported."""
+    """Launch the pygame display worker before habitat-sim is imported.
+
+    The ordering in the name is a hard requirement, not a preference — see the comment above
+    on the EGL/GLX conflict. Once habitat-sim has initialised EGL in this process, forking a
+    child that tries to open an X11 window will fail or crash.
+    """
     global _display_queue, _ack_queue, _display_proc
     if _display_proc is not None:
-        return
+        return   # idempotent
     ctx = _mp.get_context("spawn")   # spawn avoids inheriting any EGL state
+                                     # (fork would copy the parent's GL context and deadlock)
     _display_queue = ctx.Queue()
     _ack_queue     = ctx.Queue()
     _display_proc  = ctx.Process(
         target=_display_worker,
         args=(_display_queue, _ack_queue),
-        daemon=True,
+        daemon=True,   # never outlive the main process
     )
     _display_proc.start()
     print("[pygame] display process started", flush=True)
 
 
 def stop_display_process():
+    """Ask the display worker to exit (the None sentinel breaks its loop)."""
     if _display_queue is not None:
         _display_queue.put(None)
 
 
 def _pg_show(frame: np.ndarray, pause: bool = False):
-    """Send a frame to the display process."""
+    """Send a frame to the display process.
+
+    No-op when rendering is off, so call sites don't need to guard. The .copy() is required:
+    the frame is a view into a buffer the simulator will overwrite, and the queue serialises
+    it asynchronously.
+    """
     if not _RENDER or _display_queue is None:
         return
     _display_queue.put((frame.copy(), pause))
@@ -203,6 +264,8 @@ class HabitatToolbox(BaseToolbox):
         # correct for navigation/OVMM) or "arm_workspace" (head view + arm
         # reachability overlay — the OWMM baseline's eval camera, for parity).
         self._primary_camera = primary_camera
+        # Two fix-ups applied to the freshly-reset env before anything runs. Both are
+        # working around Habitat defaults that are wrong for this agent — see each method.
         self._configure_gripper_camera()
         self._force_dynamic_scene_objects()
         self._third_person_frame_idx = 0
@@ -222,13 +285,23 @@ class HabitatToolbox(BaseToolbox):
 
     @property
     def _sim(self):
+        """The raw habitat_sim Simulator, beneath the RL-env wrapper."""
         return self._env._sim
 
     def _robot(self):
+        """The Fetch articulated agent. Single-agent setup, hence the hard-coded [0]."""
         return self._sim.agents_mgr[0].articulated_agent
 
     def _configure_gripper_camera(self) -> None:
-        """Aim Fetch's arm camera at the gripper instead of the floor/body."""
+        """Aim Fetch's arm camera at the gripper instead of the floor/body.
+
+        Habitat's stock arm camera points at nothing useful, which makes it worthless for
+        verifying a grasp. The block below re-mounts it. The geometry is fiddly and was
+        derived empirically (with tools/tune_wrist_cam.py and tools/wrist_cam_diag.py), so
+        the reasoning is recorded inline rather than left to be re-discovered.
+
+        Non-fatal on failure: a bad camera costs a useful view, not the run.
+        """
         try:
             import magnum as mn
 
@@ -266,6 +339,16 @@ class HabitatToolbox(BaseToolbox):
         ``OVMM_FORCE_ALL_RIGID_DYNAMIC=1`` also converts every rigid handle in
         the scene, but that can destabilize HSSD scenes because many large
         environment assets start interpenetrating other geometry.
+
+        Why this is needed at all: OVMM episodes load their target objects as STATIC by
+        default, so a "grasped" object would not move with the gripper and a placed one
+        would hang in mid-air. Converting them to DYNAMIC is what makes manipulation
+        physical rather than cosmetic.
+
+        Why it is scoped by default: `scene_obj_ids` is just the episode's own objects.
+        The env-var escape hatch converts *every* rigid body in the scene, which sounds more
+        thorough but in practice explodes — HSSD scenes ship with large assets that start
+        interpenetrating, and waking them all up launches the furniture across the room.
         """
         try:
             import habitat_sim
@@ -289,8 +372,12 @@ class HabitatToolbox(BaseToolbox):
                     continue
                 obj.motion_type = habitat_sim.physics.MotionType.DYNAMIC
                 obj.collidable = True
+                # Zero the velocities: switching motion type can leave stale values that
+                # would fling the object the instant physics resumes.
                 obj.linear_velocity = mn.Vector3.zero_init()
                 obj.angular_velocity = mn.Vector3.zero_init()
+                # awake=True — a sleeping body ignores contacts until something wakes it, so
+                # the gripper would pass straight through the object it is trying to grasp.
                 obj.awake = True
                 converted += 1
             scope = "all rigid handles" if force_all else "episode scene objects"
@@ -300,7 +387,11 @@ class HabitatToolbox(BaseToolbox):
             print(f"[physics] dynamic scene-object setup skipped: {exc}", flush=True)
 
     def _null_step_action(self) -> dict:
-        """Action dict that advances physics without moving the robot."""
+        """Action dict that advances physics without moving the robot.
+
+        Habitat has no "just step" call — every step must carry an action — so a zero base
+        velocity is how we let time pass (for physics to settle, or simply to grab a frame).
+        """
         return {
             "action": "base_velocity",
             "action_args": {"base_vel": np.zeros(2, dtype=np.float32)},
@@ -308,15 +399,21 @@ class HabitatToolbox(BaseToolbox):
 
     # ── Abstract primitive implementations ───────────────────────────────────
 
-    # Set True by PromptEmbodiedAgent after each VLM policy call
+    # Set True by PromptEmbodiedAgent after each VLM policy call.
+    # Read (and cleared) by _step below to implement step-mode: the human sees the frame the
+    # VLM decided on and presses SPACE before the robot acts on it.
     vlm_just_decided: bool = False
 
     def _step(self) -> dict:
         """Advance one simulation step (null action)."""
+        # A finished episode cannot be stepped — Habitat raises. Hand back the last
+        # observation so callers still in a control loop unwind cleanly.
         if self._env._episode_over:
             return self._last_obs or {}
         obs = self._env.step(self._null_step_action())
         self._last_obs = obs
+        # Pause exactly once per VLM decision, not on every physics step of the action that
+        # follows it — hence consuming the flag here.
         should_pause = _STEP and self.vlm_just_decided
         if should_pause:
             self.vlm_just_decided = False
@@ -324,6 +421,8 @@ class HabitatToolbox(BaseToolbox):
             self._show_frame(obs, pause=should_pause)
         elif self._display:
             self._show_frame(obs)
+        # Memory accrues as a side effect of simply existing in the world — no explicit
+        # "remember this" tool. Throttled internally.
         self._memorize_live(obs)
         return obs
 
@@ -342,11 +441,18 @@ class HabitatToolbox(BaseToolbox):
         if not force and (now - self._last_ingest_t) < _LIVE_INGEST_INTERVAL:
             return
 
+        # Always the HEAD camera, even when primary_camera is "arm_workspace": memory must
+        # be visually consistent with the scan frames it is being indexed alongside, and a
+        # gripper close-up is useless as a place to navigate back to.
         rgb = self._scan_rgb(obs)   # head camera regardless of primary_camera
         if rgb is None:
             return
-        self._last_ingest_t = now
+        self._last_ingest_t = now   # only advance the throttle on an actual capture
 
+        # Created on first use — a run with no memory never spins up the worker.
+        # Writing into capture_out_dir means live frames land in the SAME dataset the
+        # offline scan produced, and the frame counter continues from where the scan left
+        # off (see NavCaptureWorker.__init__), so ids can't collide.
         if self._live_navcap is None:
             from sim.capture import NavCaptureWorker
             self._live_navcap = NavCaptureWorker(out_dir=str(self.capture_out_dir))
@@ -354,6 +460,8 @@ class HabitatToolbox(BaseToolbox):
         pose = self._get_robot_pose()                 # [x_nav, z_nav, heading]
         xy   = np.array([pose[0], pose[1]], dtype=np.float32)
         idx  = self._live_navcap.enqueue(rgb, xy, pose[2])
+        # Must match what NavCaptureWorker will write — this path is the join key between
+        # the FAISS index and the images on disk.
         frame_path = os.path.join(str(self.capture_out_dir), "color", f"{idx:06d}.png")
 
         self.embedding_worker.enqueue(rgb=rgb, frame_path=frame_path,
@@ -392,15 +500,24 @@ class HabitatToolbox(BaseToolbox):
             self._live_navcap = None
 
     def _show_frame(self, obs: dict, pause: bool = False) -> None:
-        """Display camera images via pygame: third-person, head."""
+        """Display camera images via pygame: third-person, head.
+
+        Builds a side-by-side canvas of whichever panels are available. Each slot is a tuple
+        of candidate observation keys because the key names differ between single-agent and
+        multi-agent Habitat configs ("head_rgb" vs "agent_0_head_rgb") — first hit wins.
+
+        Panels are scaled to a common height so np.concatenate can join them horizontally
+        (which requires matching row counts). Missing panels are simply skipped, so this
+        renders whatever exists rather than requiring a particular sensor set.
+        """
         if _RECORD_THIRD_PERSON:
             self._record_third_person_frame(obs)
         if not _RENDER:
             return
         try:
             panel_slots = (
-                ("third_person_sensor",),
-                ("head_rgb", "agent_0_head_rgb"),
+                ("third_person_sensor",),                # what the robot looks like
+                ("head_rgb", "agent_0_head_rgb"),        # what the robot sees
             )
             panels = []
             TARGET_H = 512
@@ -414,11 +531,12 @@ class HabitatToolbox(BaseToolbox):
                         continue
                     arr = np.asarray(arr)
                     if arr.ndim == 3 and arr.shape[2] >= 3:
-                        rgb = arr[..., :3].astype(np.uint8)
+                        rgb = arr[..., :3].astype(np.uint8)   # drop alpha if present
                         break
                 if rgb is None:
                     continue
 
+                # Uniform height, aspect-preserving width.
                 h, w = rgb.shape[:2]
                 scale = TARGET_H / h
                 new_w = max(1, int(w * scale))
@@ -430,9 +548,15 @@ class HabitatToolbox(BaseToolbox):
             canvas = np.concatenate(panels, axis=1) if len(panels) > 1 else panels[0]
             _pg_show(canvas, pause=pause)
         except Exception as e:
+            # Display is never worth failing an episode over.
             print(f"[display] {e}")
 
     def _record_third_person_frame(self, obs: dict) -> None:
+        """Dump the third-person camera to a numbered PNG (enabled by env var).
+
+        Independent of the live display: this is how an episode video gets made, so it runs
+        even in a headless run. Frames are sequential, so `ffmpeg` can stitch them directly.
+        """
         try:
             arr = obs.get("third_person_sensor")
             if arr is None:
@@ -459,6 +583,8 @@ class HabitatToolbox(BaseToolbox):
         must NOT be the primary observation for navigation/scene reasoning.
         For OWMM-baseline parity set primary_camera="arm_workspace".
         """
+        # The mode only reorders the preference list — every camera remains a fallback, so a
+        # config missing the preferred sensor still yields *an* image rather than None.
         if self._primary_camera == "arm_workspace":
             order = ("arm_workspace_rgb", "articulated_agent_arm_rgb",
                      "head_rgb", "agent_0_head_rgb")
@@ -485,10 +611,14 @@ class HabitatToolbox(BaseToolbox):
         try:
             gm = self._sim.grasp_mgr
         except Exception:
+            # No grasp manager at all → we genuinely cannot tell. None (not False) so the
+            # policy falls back to visual judgment instead of being told "empty hand".
             return None
         idx = getattr(gm, "snap_idx", None)
         if idx is None:
             return {"grasped": False, "object": None}
+        # Holding something. Resolving its handle is a nicety — if that lookup fails we still
+        # report grasped=True, because *that* is the fact the policy needs.
         name = None
         try:
             obj = self._sim.get_rigid_object_manager().get_object_by_id(idx)
@@ -503,13 +633,21 @@ class HabitatToolbox(BaseToolbox):
 
         localization_sensor outputs [world.X, world.Y, world.Z, heading].
         Navigation plane is XZ, so nav coords are (world.X, world.Z).
+
+        Note the index skip — [0], [2], [3], NOT [0], [1], [2]. Element 1 is world Y (the
+        robot's height), which is not part of a planar pose. This is the coordinate remap
+        described in the module docstring, and dropping the wrong axis here is a bug that
+        manifests much later as navigation goals at nonsensical positions.
         """
         obs = self._last_obs or {}
         loc = obs.get("localization_sensor")
         if loc is None:
+            # No localization sensor configured — derive the pose from the robot directly.
             try:
                 robot = self._robot()
                 pos = np.array(robot.base_pos)
+                # Heading: transform the robot's local +X (forward) into world space, then
+                # take its angle in the XZ plane. atan2(z, x) — again, Y is skipped.
                 fwd = np.array([1.0, 0.0, 0.0])
                 T = robot.base_transformation
                 heading = math.atan2(
@@ -518,7 +656,7 @@ class HabitatToolbox(BaseToolbox):
                 )
                 return [float(pos[0]), float(pos[2]), float(heading)]
             except Exception:
-                return [0.0, 0.0, 0.0]
+                return [0.0, 0.0, 0.0]   # last resort; better than raising mid-episode
         loc = np.asarray(loc).flatten()
         return [float(loc[0]), float(loc[2]), float(loc[3])]
 
@@ -526,9 +664,15 @@ class HabitatToolbox(BaseToolbox):
         """
         Send one base_velocity command.  Used by BaseToolbox._align_yaw()
         for final orientation alignment.
+
+        Turn-then-drive, exactly as in the ManiSkill backend: a bearing beyond _ROT_THRESH
+        produces a pure rotation, anything smaller drives straight. _align_yaw relies on this
+        by clamping its bearing above the threshold so it only ever rotates.
         """
         if self._env._episode_over:
             return
+        # base_vel is [forward, angular]. copysign preserves the turn direction while
+        # applying the fixed turn rate.
         if abs(bearing) > _ROT_THRESH:
             vel = np.array([0.0, math.copysign(_TURN_VEL, bearing)], dtype=np.float32)
         else:
@@ -542,6 +686,19 @@ class HabitatToolbox(BaseToolbox):
             self._show_frame(obs)
 
     def _base_move_step(self, motion: str) -> None:
+        """One tick of a discrete base motion, routed through whichever mechanism can do it.
+
+        Habitat's base_velocity action is configurable and often CANNOT do what the agent's
+        motion vocabulary asks for:
+          * a 2-D action space ([forward, angular]) has no lateral channel, so "left"/"right"
+            (strafing) are unexpressible;
+          * many configs set _allow_back=False, so "backward" is silently clamped to zero.
+
+        Rather than degrade the agent's action set to the lowest common denominator, we fall
+        back to _direct_planar_step (which moves the robot kinematically) for exactly those
+        motions the controller can't express. The agent therefore always has the same six
+        motions available, regardless of the Habitat config it is running against.
+        """
         if self._env._episode_over:
             return
 
@@ -553,6 +710,7 @@ class HabitatToolbox(BaseToolbox):
             self._direct_planar_step(motion)
             return
 
+        # 3-D action space: [forward, lateral, angular].
         if has_lateral:
             if motion == "forward":
                 vel = np.array([_FWD_VEL, 0.0, 0.0], dtype=np.float32)
@@ -569,6 +727,8 @@ class HabitatToolbox(BaseToolbox):
             else:
                 return
         else:
+            # 2-D action space: [forward, angular]. left/right never reach here (they were
+            # routed to _direct_planar_step above).
             if motion == "forward":
                 vel = np.array([_FWD_VEL, 0.0], dtype=np.float32)
             elif motion == "backward":
@@ -589,6 +749,12 @@ class HabitatToolbox(BaseToolbox):
             self._show_frame(obs)
 
     def _base_velocity_has_lateral(self) -> bool:
+        """Does base_velocity accept a strafe channel? (action-space width >= 3)
+
+        Introspects the gym space rather than the config, so it reflects what the action will
+        actually accept. Conservative on failure: assume 2-D, which routes strafes through
+        the kinematic fallback — always correct, just less physical.
+        """
         try:
             action = self._env._task.actions.get("base_velocity")
             space = getattr(action, "action_space", None)
@@ -602,6 +768,14 @@ class HabitatToolbox(BaseToolbox):
         return False
 
     def _base_velocity_allows_backward(self) -> bool:
+        """Does the controller permit negative forward velocity?
+
+        Many OVMM configs set _allow_back=False (the policy they were built for was
+        forward-only), which silently CLAMPS a reverse command to zero rather than erroring —
+        so without this check "backward" would appear to run and do nothing.
+
+        Defaults to True when the attribute is absent, matching Habitat's own default.
+        """
         try:
             action = self._env._task.actions.get("base_velocity")
             return bool(getattr(action, "_allow_back", True))
@@ -647,16 +821,34 @@ class HabitatToolbox(BaseToolbox):
         """
         Stub — oracle_nav_coord_action handles path planning internally.
         Returns a direct two-point path so BaseToolbox._align_yaw works.
+
+        Unlike the ManiSkill backend (which plans with NavGrid), this backend overrides
+        navigate() entirely and hands the goal to Habitat's oracle navigator, so no path is
+        ever needed. The two-point stub exists only to satisfy the base class's signature.
         """
         return [start_xy.copy(), goal_xy.copy()]
 
     def _locate_target_object(self, target: str):
         """Aiming: localize `target` in the head image and return the matching
         scene-object id + its world position + pixel (u,v). Returns
-        (obj_id, obj_world_xyz, (u,v)) or (None, None, None)."""
+        (obj_id, obj_world_xyz, (u,v)) or (None, None, None).
+
+        This is the PERCEPTION-ONLY path to a grasp target, and it is the heart of what makes
+        grasping here honest rather than an oracle:
+
+            name → detector → pixel → ray → the object that pixel actually sees
+
+        The final ray-cast step is what matters. Rather than trusting the depth estimate and
+        then guessing which nearby object it must have meant, we ask the simulator "what
+        surface does this pixel see?" and take that. If the answer is not one of the task's
+        pickable objects — it's the floor, a wall, the robot's own arm — aiming FAILS. There
+        is deliberately no "nearest object" fallback that would quietly rescue a bad aim, so
+        the agent cannot grasp something it did not actually look at.
+        """
         obs = self._last_obs
         if obs is None:
             return None, None, None
+        # Sensor key differs across single/multi-agent configs.
         depth = None
         for dk in ("head_depth", "agent_0_head_depth"):
             if dk in obs:
@@ -673,42 +865,86 @@ class HabitatToolbox(BaseToolbox):
                 rgb_full = np.array(_PIL.open(self._last_image_path).convert("RGB"))
             except Exception:
                 rgb_full = None
-        bbox, src = None, "none"
+
+        # ── Localise the target: gather ALL candidate boxes, aim at the first
+        # whose ray lands on a pickable scene object. ─────────────────────────
+        # An open-vocab detector routinely returns several boxes for one query, and
+        # the HIGHEST-confidence one is often a false positive (e.g. a "toy vehicle"
+        # query scoring a rug pattern above the actual toy). Trusting dets[0] blindly
+        # then rays into empty floor and the grasp fails even though the real object
+        # WAS detected at a lower rank. So we try every candidate and keep the first
+        # that raycasts onto one of the episode's pickable objects — still no fuzzy
+        # "nearest object" rescue, just "don't discard a correct lower-ranked box".
+        candidates: list[tuple[list, str]] = []
         if self._grounding_dino is not None and rgb_full is not None:
             try:
                 dets = self._grounding_dino.detect(rgb_full, target)
-                if dets:
-                    bbox = dets[0]["bbox"]; src = "gdino"
+                candidates += [(det["bbox"], "gdino") for det in (dets or [])]
             except Exception as _e:
                 print(f"[HabitatToolbox] GDino failed: {_e}")
-        if bbox is None:
+        # Only pay for the VLM inspect call when the detector produced nothing.
+        if not candidates:
             ir = self.inspect(image_path=self._last_image_path or "",
                               question=f"Locate the {target}. Return its pixel bounding box.")
             if ir.ok:
-                c = ir.data.get("candidate_bboxes", [])
-                if c:
-                    bbox = c[0]; src = "inspect"
-        if not bbox or len(bbox) < 4:
+                candidates += [(b, "inspect") for b in ir.data.get("candidate_bboxes", [])]
+        if not candidates:
             return None, None, None
-        x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
-        x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
-        x2 = max(x1 + 1, min(W, x2)); y2 = max(y1 + 1, min(H, y2))
-        u, v = (x1 + x2) // 2, (y1 + y2) // 2
-        mx, my = (x2 - x1) // 5, (y2 - y1) // 5
-        patch = depth[y1 + my:y2 - my or y2, x1 + mx:x2 - mx or x2]
-        valid = patch[(patch > 0.05) & (patch < 10.0)]
-        d = float(np.median(valid)) if valid.size else float(depth[v, u])
-        self._save_localization_crop(rgb_full, (x1, y1, x2, y2), target, src, d)
-        # Identify the EXACT object the pixel lands on by casting a ray from the
-        # head camera through (u, v): the closest surface hit IS what the pixel
-        # sees. If that surface is not one of the task's pickable scene objects,
-        # the pixel is not on a graspable object → aiming fails (no fuzzy
-        # "nearest object" fallback).
-        obj_id, hit_world = self._raycast_pixel_to_object(u, v, (W, H), T)
-        if obj_id is None:
-            return None, hit_world, (u, v)
+
         rom = self._sim.get_rigid_object_manager()
-        return obj_id, np.array(rom.get_object_by_id(obj_id).translation), (u, v)
+        fallback = None  # (u, v, hit_world) of the first tried point, for diagnostics
+        for bbox, src in candidates:
+            if not bbox or len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [int(vv) for vv in bbox[:4]]
+            x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
+            x2 = max(x1 + 1, min(W, x2)); y2 = max(y1 + 1, min(H, y2))
+            cu, cv = (x1 + x2) // 2, (y1 + y2) // 2
+
+            # Depth from the INNER 60% of the box (inset a fifth each side): border
+            # pixels straddle the silhouette and read the wall behind. `or x2` guards
+            # a tiny box that insets to an empty slice.
+            mx, my = (x2 - x1) // 5, (y2 - y1) // 5
+            patch = depth[y1 + my:y2 - my or y2, x1 + mx:x2 - mx or x2]
+            valid = patch[(patch > 0.05) & (patch < 10.0)]
+            d = float(np.median(valid)) if valid.size else float(depth[cv, cu])
+
+            # Ray-cast a GRID of points inside the box, not just the centre. A small
+            # object often does not fill its box, so the centre pixel can land on the
+            # stool/floor behind it; sweeping a few interior points finds the one that
+            # actually sees the object. Points are ordered centre-out so we prefer the
+            # middle when several hit. Still strict: accept only a pickable scene object.
+            us = sorted({int(round(x1 + (x2 - x1) * fx)) for fx in (0.5, 0.35, 0.65, 0.5, 0.5)},
+                        key=lambda x: abs(x - cu))
+            vs = sorted({int(round(y1 + (y2 - y1) * fy)) for fy in (0.5, 0.35, 0.65, 0.5, 0.5)},
+                        key=lambda y: abs(y - cv))
+            hit_id = None; hit_uv = (cu, cv)
+            tried = 0
+            for pv in vs:
+                for pu in us:
+                    tried += 1
+                    oid, hw = self._raycast_pixel_to_object(pu, pv, (W, H), T)
+                    if fallback is None:
+                        fallback = (pu, pv, hw)
+                    if oid is not None:
+                        hit_id, hit_uv = oid, (pu, pv)
+                        break
+                if hit_id is not None:
+                    break
+            if os.environ.get("GRASP_DEBUG"):
+                print(f"[GRASP_DEBUG] target={target!r} src={src} bbox={bbox[:4]} "
+                      f"depth={d:.2f}m tried={tried}pts ray_obj_id={hit_id} "
+                      f"hit_uv={hit_uv} hit={hit_id is not None} "
+                      f"n_scene_obj_ids={len(getattr(self._sim, 'scene_obj_ids', []))}",
+                      flush=True)
+            if hit_id is not None:
+                u, v = hit_uv
+                self._save_localization_crop(rgb_full, (x1, y1, x2, y2), target, src, d)
+                return hit_id, np.array(rom.get_object_by_id(hit_id).translation), (u, v)
+
+        # No candidate box landed on a pickable object.
+        u, v, hit_world = fallback if fallback else (None, None, None)
+        return None, hit_world, (u, v)
 
     def _raycast_pixel_to_object(
         self, u: int, v: int, wh: tuple[int, int], T: np.ndarray
@@ -733,14 +969,18 @@ class HabitatToolbox(BaseToolbox):
         hfov  = math.pi / 2.0
         f_inv = math.tan(hfov / 2.0)
         # Pixel → normalised camera-space direction (Habitat: forward = -Z_cam).
+        # ys is flipped because image rows increase downward while camera Y increases up.
         xs = 2.0 * u / (W - 1) - 1.0
         ys = 1.0 - 2.0 * v / (H - 1)
+        # Trailing 0.0 (not 1.0): this is a DIRECTION, not a point, so the transform must
+        # rotate it without applying the camera's translation.
         dir_world = T @ np.array([xs * f_inv, ys * f_inv, -1.0, 0.0])
         dirw = np.array(dir_world[:3], dtype=np.float64)
         n = float(np.linalg.norm(dirw))
         if n < 1e-9:
             return None, None
         dirw /= n
+        # The ray starts at the camera, which is T's translation column.
         origin = np.array([T[0, 3], T[1, 3], T[2, 3]], dtype=np.float64)
 
         ray = habitat_sim.geo.Ray(mn.Vector3(*origin), mn.Vector3(*dirw))
@@ -749,9 +989,40 @@ class HabitatToolbox(BaseToolbox):
             return None, None
         hit = res.hits[0]                       # closest surface along the ray
         world_pt = np.array([hit.point[0], hit.point[1], hit.point[2]])
+        # The membership test that makes this strict: only the episode's own pickable
+        # objects count. A hit on the floor, a wall, a table, or the robot returns None for
+        # the id — the caller reads that as "the pixel is not on something graspable" and
+        # refuses the grasp. The world point is still returned, since it is useful for
+        # diagnostics even when the aim failed.
         scene_ids = {int(i) for i in getattr(self._sim, "scene_obj_ids", [])}
         if int(hit.object_id) in scene_ids:
             return int(hit.object_id), world_pt
+
+        # The ray usually lands on the RECEPTACLE (stool/table/floor) a small object
+        # sits on, not the object's own tiny collision mesh — habitat's cast_ray
+        # returns the frontmost surface, and a toy a few cm tall barely occludes the
+        # surface behind it. So if a PICKABLE scene object sits right at the hit
+        # point, that is what the pixel is really aiming at. Tight radius keeps this
+        # honest: it rescues "ray grazed the shelf under the mug", not "nearest object
+        # anywhere". Objects resting ON the surface sit just above it, hence the
+        # slightly larger vertical tolerance.
+        rom = self._sim.get_rigid_object_manager()
+        best_id, best_d = None, _GRASP_SNAP_RADIUS
+        for sid in scene_ids:
+            try:
+                op = np.array(rom.get_object_by_id(sid).translation)
+            except Exception:
+                continue
+            dxz = math.hypot(op[0] - world_pt[0], op[2] - world_pt[2])
+            dy = abs(op[1] - world_pt[1])
+            if dxz <= _GRASP_SNAP_RADIUS and dy <= _GRASP_SNAP_RADIUS_Y and dxz < best_d:
+                best_id, best_d = int(sid), dxz
+        if os.environ.get("GRASP_DEBUG"):
+            print(f"[RAY_DEBUG] px=({u},{v}) raw_hit_id={int(hit.object_id)} "
+                  f"hit_pt=({world_pt[0]:.2f},{world_pt[1]:.2f},{world_pt[2]:.2f}) "
+                  f"snapped_scene_obj={best_id} (d={best_d:.2f}m)", flush=True)
+        if best_id is not None:
+            return best_id, world_pt
         return None, world_pt
 
     def _locate_place_pixel(self, destination: str):
@@ -812,8 +1083,15 @@ class HabitatToolbox(BaseToolbox):
         x1 = max(0, min(W - 1, x1)); y1 = max(0, min(H - 1, y1))
         x2 = max(x1 + 1, min(W, x2)); y2 = max(y1 + 1, min(H, y2))
         u = (x1 + x2) // 2
+        # NOT the box centre vertically — 22% down from the top edge. See the docstring: a
+        # detector box around a "counter" or "cabinet" is dominated by its front FACE, whose
+        # centre is a vertical surface you cannot put anything on. Aiming high in the box
+        # biases toward the top edge, which is where the horizontal support surface is.
         v = y1 + max(1, int(0.22 * (y2 - y1)))
 
+        # Small local window around the aim point (rather than the whole box, as in
+        # _locate_target_object) — we want the depth AT the chosen placement point, not an
+        # average over the whole receptacle, which spans a wide depth range.
         r = 5
         patch = depth[max(0, v - r):min(H, v + r + 1),
                       max(0, u - r):min(W, u + r + 1)]
@@ -822,8 +1100,12 @@ class HabitatToolbox(BaseToolbox):
         self._save_localization_crop(rgb_full, (x1, y1, x2, y2),
                                      destination, src, d)
         if d < 0.05 or d > 10.0:
+            # Implausible depth. Return the pixel anyway (the arm action can still aim at
+            # it) but no world point, and say why in the source tag.
             return (float(u), float(v)), None, f"{src}:invalid_depth"
 
+        # Un-project (u, v, d) to a world point. Trailing 1.0 → this IS a point, so the
+        # camera translation applies (contrast the direction vector in _raycast_pixel_to_object).
         f_inv = math.tan((math.pi / 2) / 2)
         xs = 2.0 * u / (W - 1) - 1.0
         ys = 1.0 - 2.0 * v / (H - 1)
@@ -933,6 +1215,7 @@ class HabitatToolbox(BaseToolbox):
         sim, robot = self._sim, self._robot()
         rom = sim.get_rigid_object_manager()
 
+        # ── AIM. Perception only — see _locate_target_object. ─────────────────
         obj_id, _obj_pos, pixel = self._locate_target_object(target)
         if obj_id is None:
             # Pixel is not on any pickable object → genuine inability to act.
@@ -952,12 +1235,14 @@ class HabitatToolbox(BaseToolbox):
                 pass
 
         def _ee_to_obj() -> float:
+            """Live end-effector → object distance. Re-read every step: BOTH may move (the
+            arm drives in, and the object can be nudged by contact)."""
             ee = np.array(robot.ee_transform().translation)
             return float(np.linalg.norm(np.array(rom.get_object_by_id(obj_id).translation) - ee))
 
         d = _ee_to_obj()
         grasped = False
-        closing = False
+        closing = False   # latches once the fingers have been commanded shut
         # ── ARM MOTION: drive the arm with IK toward the target's pixel ───────
         # via the registered arm_pick_action (PixelArmAction). Env.step works
         # for arm actions now that EmbodiedTask.step renders sensors for non-dict
@@ -966,28 +1251,40 @@ class HabitatToolbox(BaseToolbox):
             if self._env._episode_over:
                 break
             # magic: stop once within reach. suction: keep pressing to contact.
+            # (In suction mode the loop only exits via a successful snap or the step cap —
+            # proximity alone is not enough, physical contact is required.)
             if not suction and d < _GRASP_REACH_THRESH:
                 break
+            # The arm action is PIXEL-targeted, not coordinate-targeted: we hand it (px, py)
+            # and it runs IK toward whatever that pixel sees. So the arm chases the same
+            # perceptual target the detector found, rather than a ground-truth position.
             obs = self._env.step({
                 "action": "arm_pick_action",
                 "action_args": {
                     "arm_pick_action":  np.array([px, py, 1.0], dtype=np.float32),
                     "grip_pick_action": np.array([0.0], dtype=np.float32),  # snap manually
+                                        # 0 = don't let the action auto-grasp; we control
+                                        # exactly when the snap fires (below).
                 },
             })
             self._last_obs = obs
+            # Throttled: this loop can run 90 steps and the display queue would choke.
             if (_RENDER or self._display) and step % _RENDER_EVERY == 0:
                 self._show_frame(obs)
             d = _ee_to_obj()
             if suction:
                 # Once the hand is on the object, close the fingers so they
                 # physically engage it (and keep pressing toward the pixel).
+                # `closing` latches — issue the close once, then keep driving in; re-issuing
+                # every step would fight the motor controller.
                 if not closing and d < _GRASP_CLOSE_DIST:
                     try:
                         robot.close_gripper()
                     except Exception:
                         pass
                     closing = True
+                # Poll for contact every step. Returns False until the fingers actually
+                # touch, at which point it snaps and we're done.
                 if self._suction_snap(obj_id):
                     grasped = True
                     break
@@ -999,11 +1296,16 @@ class HabitatToolbox(BaseToolbox):
         if grasped:
             self._last_obs = self._env.step(self._null_step_action())  # settle
         elif not suction and d < _GRASP_REACH_THRESH:
+            # Magic mode: proximity is sufficient, so snap now that the arm has arrived.
             try:
                 sim.grasp_mgr.snap_to_obj(obj_id, force=True)
                 self._last_obs = self._env.step(self._null_step_action())  # settle
             except Exception as e:
                 print(f"[HabitatToolbox._grasp] snap_to_obj failed: {e}", flush=True)
+        # Note: falling through here (neither branch taken) is NOT an error — it means the
+        # arm reached for a real object and failed to get hold of it. We still return True,
+        # because True means "attempted", and BaseToolbox.manipulate will consult
+        # _grasp_state() for the physics truth of whether anything is actually held.
         return True, name, d
 
     def _retract_arm(self, settle_steps: int = 12, move_steps: int = 60) -> None:
@@ -1044,6 +1346,7 @@ class HabitatToolbox(BaseToolbox):
 
         # 3. Ramp the motor target there gradually so a grasped object tracks
         #    the hand instead of being flung out of the constraint.
+        #    alpha goes 1/n … 1, i.e. a linear interpolation from `start` to `final`.
         n = max(1, int(move_steps))
         for step in range(n):
             if self._env._episode_over:
@@ -1072,7 +1375,18 @@ class HabitatToolbox(BaseToolbox):
         destination: Optional[str] = None,
         target_region: Optional[str] = None,
     ) -> tuple[bool, str]:
-        """Place/drop held object, then verify Habitat cleared the grasp."""
+        """Place/drop held object, then verify Habitat cleared the grasp.
+
+        Three phases:
+          1. If a destination was named (and the env supports pixel-targeted placing), drive
+             the arm over the receptacle — same perception path as grasping, via
+             _locate_place_pixel.
+          2. Break the grasp constraint (desnap), first making sure the object will actually
+             fall (see _enable_released_object_physics).
+          3. Step physics so it lands and settles before the agent looks again.
+
+        Phase 1 is skipped entirely for a bare "drop", which just opens the hand where it is.
+        """
         grasp_mgr = self._sim.grasp_mgr
         held_id = grasp_mgr.snap_idx
         if held_id is None:
@@ -1084,10 +1398,14 @@ class HabitatToolbox(BaseToolbox):
         place_src = "none"
         release_force = True
 
+        # ── Phase 1: move the arm over the destination ────────────────────────
         if dest and "arm_place_action" in self._env._task.actions:
             place_pixel, place_world, place_src = self._locate_place_pixel(dest)
             if place_pixel is not None:
                 px, py = place_pixel
+                # Drive toward the placement pixel until the EE is close to the estimated
+                # world point (or we run out of steps). Without a world point we cannot
+                # measure arrival, so the loop just runs its full budget.
                 for step in range(_PLACE_MAX_STEPS):
                     if self._env._episode_over:
                         break
@@ -1106,6 +1424,9 @@ class HabitatToolbox(BaseToolbox):
                         if float(np.linalg.norm(ee - place_world)) < _PLACE_REACH_THRESH:
                             break
 
+                # Signal release through the action itself (grip = -1) for a few steps, so
+                # the env's own place logic gets a chance to run. The explicit desnap below
+                # is the backstop for when it doesn't.
                 for _ in range(3):
                     if self._env._episode_over:
                         break
@@ -1118,7 +1439,12 @@ class HabitatToolbox(BaseToolbox):
                     })
                     self._last_obs = obs
 
+        # ── Phase 2: force the constraint open if it is still holding ─────────
         if grasp_mgr.snap_idx is not None:
+            # Order matters: make the object dynamic BEFORE desnapping, or it is briefly
+            # released while still kinematic and freezes in mid-air.
+            # release_force = "let Habitat handle the drop" — only needed when we could not
+            # set up the physics ourselves.
             release_force = not self._enable_released_object_physics(held_id)
             try:
                 # Clear the magic-grasp constraint. We then tick physics
@@ -1127,12 +1453,15 @@ class HabitatToolbox(BaseToolbox):
                 grasp_mgr.desnap(release_force)
             except Exception as e:
                 print(f"[HabitatToolbox._release] desnap failed: {e}")
+            # Retry once. desnap occasionally no-ops when the constraint is in an odd state,
+            # and an object welded to the hand would silently break every later step.
             if grasp_mgr.snap_idx is not None:
                 try:
                     grasp_mgr.desnap(release_force)
                 except Exception as e:
                     print(f"[HabitatToolbox._release] forced desnap failed: {e}")
 
+        # ── Phase 3: let it fall ──────────────────────────────────────────────
         released = grasp_mgr.snap_idx is None
         if released:
             self._settle_release_physics(10)
@@ -1174,8 +1503,13 @@ class HabitatToolbox(BaseToolbox):
             obj.collidable = True
             obj.linear_velocity = mn.Vector3.zero_init()
             obj.angular_velocity = mn.Vector3.zero_init()
-            obj.awake = True
+            obj.awake = True   # a sleeping body ignores gravity until something wakes it
             try:
+                # Park it in the held-object collision group for the moment of release. At
+                # the instant of desnap the object is still interpenetrating the gripper
+                # links; in the normal group the solver would resolve that overlap by
+                # violently ejecting it. UserGroup7 doesn't collide with the robot, so it
+                # falls cleanly out of the hand instead of being shot across the room.
                 obj.override_collision_group(CollisionGroups.UserGroup7)
             except Exception:
                 pass
@@ -1186,10 +1520,19 @@ class HabitatToolbox(BaseToolbox):
             return False
 
     def _settle_release_physics(self, steps: int = 1) -> None:
-        """Tick Habitat physics explicitly after desnap/retraction."""
+        """Tick Habitat physics explicitly after desnap/retraction.
+
+        The benchmark config disables automatic physics stepping (it is a large cost the
+        RL policy doesn't need), so env.step() alone will NOT make a dropped object fall.
+        Anything that needs the world to actually evolve — a release, an arm ramp — has to
+        drive the simulator by hand, here.
+
+        maybe_update_articulated_agent() re-syncs the robot's links after the physics tick;
+        without it the arm's rendered pose lags the simulated one.
+        """
         for _ in range(max(0, int(steps))):
             try:
-                self._sim.step_physics(1.0 / 60.0)
+                self._sim.step_physics(1.0 / 60.0)   # one 60 Hz tick
             except Exception as exc:
                 print(f"[HabitatToolbox._release] physics settle failed: {exc}",
                       flush=True)
@@ -1248,7 +1591,9 @@ class HabitatToolbox(BaseToolbox):
             return None
 
         H, W = depth.shape
-        # Habitat's default head sensor uses 90° HFOV
+        # Habitat's default head sensor uses 90° HFOV.
+        # Synthesise the intrinsics from it: f = (W/2) / tan(hfov/2), principal point at the
+        # image centre. Habitat exposes no K, so this reconstruction is the only source.
         hfov = math.pi / 2.0
         fx = fy = W / (2.0 * math.tan(hfov / 2.0))
         cx, cy = W / 2.0, H / 2.0
@@ -1256,7 +1601,9 @@ class HabitatToolbox(BaseToolbox):
                       [0.0, fy, cy],
                       [0.0, 0.0, 1.0]], dtype=np.float32)
 
-        # BaseToolbox expects world-to-camera so it can invert for backprojection
+        # BaseToolbox expects world-to-camera so it can invert for backprojection.
+        # T_cw is camera-to-world, hence the inverse here — the two cancel out in the base
+        # class, but the base class's contract is what it is.
         E = np.linalg.inv(T_cw).astype(np.float32)
 
         return depth, K, E
@@ -1265,7 +1612,13 @@ class HabitatToolbox(BaseToolbox):
 
     def _save_localization_crop(self, rgb_full, box, target, src, depth_m) -> None:
         """Save the bbox crop + an annotated full frame used for object
-        localization, into <images_dir>/crops/ for inspection/debugging."""
+        localization, into <images_dir>/crops/ for inspection/debugging.
+
+        Pure diagnostics, but the most valuable diagnostic in this file: when a grasp
+        misses, these two images answer "did the detector find the right thing?" and "was
+        the depth sane?" at a glance. The annotation carries the target name, WHICH localiser
+        produced the box (gdino vs inspect), and the depth actually used.
+        """
         if rgb_full is None or not self._last_image_path:
             return
         try:
@@ -1372,7 +1725,7 @@ class HabitatToolbox(BaseToolbox):
 
         # ── Normalised pixel → camera space (Habitat convention) ─────────────
         xs_n = (2.0 * u_c / (W - 1)) - 1.0   # ∈ [-1, +1]
-        ys_n = 1.0 - (2.0 * v_c / (H - 1))   # ∈ [+1, -1]
+        ys_n = 1.0 - (2.0 * v_c / (H - 1))   # ∈ [+1, -1]  (flipped: rows grow downward)
 
         x_c =  xs_n * d * f_inv   # camera X
         y_c =  ys_n * d * f_inv   # camera Y (down in image → positive)
@@ -1383,7 +1736,10 @@ class HabitatToolbox(BaseToolbox):
         # ── Camera → world (T_cw from the sim sensor, set above) ──────────────
         p_world = T_cw @ p_cam_h
 
-        # Nav 2D: (world.X, world.Z)  — Y is vertical in Habitat
+        # Nav 2D: (world.X, world.Z)  — Y is vertical in Habitat.
+        # THIS is why the method exists rather than reusing BaseToolbox's version: the base
+        # class takes p_world[:2] (X, Y), which in Habitat is "sideways and UP" — a
+        # meaningless navigation goal. Here we take X and Z, the actual floor plane.
         obj_xy = np.array([float(p_world[0]), float(p_world[2])])
         print(f"[HabitatToolbox] depth: '{target}'  d={d:.2f}m  "
               f"world=({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f})")
@@ -1456,7 +1812,8 @@ class HabitatToolbox(BaseToolbox):
             if (_RENDER or self._display) and step % _RENDER_EVERY == 0:
                 self._show_frame(obs)
 
-            # Distance check in nav plane (XZ)
+            # Distance check in nav plane (XZ). Note loc[0] and loc[2] — element 1 is the
+            # robot's height, which must not enter a planar distance.
             loc     = np.asarray(obs.get("localization_sensor",
                                          [0.0, 0.0, 0.0, 0.0])).flatten()
             curr_2d = np.array([float(loc[0]), float(loc[2])])
@@ -1466,12 +1823,16 @@ class HabitatToolbox(BaseToolbox):
                 outcome = f"reached  dist={dist:.2f}m"
                 break
 
-            # Check oracle_nav skill_done flag
+            # Check oracle_nav skill_done flag.
+            # The oracle planner sets this when it has finished its path — which can happen
+            # while still short of the goal (the goal is off-navmesh, or behind a closed
+            # door). Treat that as best-effort rather than spinning here until _NAV_MAX_STEPS.
             nav_act = self._env._task.actions.get("oracle_nav_coord_action")
             if nav_act is not None and getattr(nav_act, "skill_done", False):
                 outcome = f"best_effort  dist={dist:.2f}m"
                 break
         else:
+            # for/else: never broke ⇒ the robot is stuck and the oracle never declared done.
             outcome = f"max_steps  dist={dist:.2f}m"
 
         # Honor a requested final orientation. oracle-nav drives position-only
@@ -1480,6 +1841,9 @@ class HabitatToolbox(BaseToolbox):
         # the agent reaches the target but faces away and can't see it.
         if target_yaw is not None and not self._env._episode_over:
             try:
+                # Set base_rot directly rather than driving _align_yaw's rotation loop: the
+                # robot has arrived and there is nothing to collide with in a pure yaw, so
+                # the loop would only burn steps.
                 self._robot().base_rot = float(target_yaw)
                 obs = self._env.step(self._null_step_action())
                 self._last_obs = obs
@@ -1490,6 +1854,9 @@ class HabitatToolbox(BaseToolbox):
                 print(f"[navigate] final yaw align failed: {e}", flush=True)
 
         obs_result = self.observe()
+        # +0.5 m of slack over the stop distance — being just outside the threshold still
+        # puts the target in view, and reporting failure would make the model retry a
+        # navigate that essentially worked.
         reached    = dist < self._NAV_STOP_DIST + 0.5
 
         return ToolResult(
@@ -1505,7 +1872,13 @@ class HabitatToolbox(BaseToolbox):
     # ── Scene scan (memory pre-population) ────────────────────────────────────
 
     def _scan_rgb(self, obs: dict) -> Optional[np.ndarray]:
-        """RGB for scene-scan memory. Prefer the wide head camera over the arm."""
+        """RGB for scene-scan memory. Prefer the wide head camera over the arm.
+
+        A FIXED preference order, unlike _capture_rgb — it deliberately ignores
+        primary_camera. Memory frames must all look alike for retrieval to work, and they
+        must be frames the robot could plausibly navigate back to, which a gripper close-up
+        is not.
+        """
         for key in ("head_rgb", "agent_0_head_rgb", "third_person_sensor",
                     "arm_workspace_rgb", "articulated_agent_arm_rgb"):
             arr = obs.get(key)
@@ -1535,6 +1908,16 @@ class HabitatToolbox(BaseToolbox):
         episode-defined start pose.
 
         Returns the number of frames captured.
+
+        This is the pre-episode "look around the apartment" pass that gives the agent
+        something to retrieve from on step 1. The robot is TELEPORTED between viewpoints
+        rather than driven, which is legitimate precisely because of the reset at the end:
+        the teleporting happens outside the episode, costs no steps, and leaves no trace in
+        the task metrics. What it leaves behind is memory — frames + poses on disk, indexed
+        in FAISS — exactly as if the robot had walked the route.
+
+        n_points × len(yaws) frames: at each sampled floor position the robot spins through
+        four cardinal headings, so a single position yields 360° of coverage.
         """
         import magnum as mn
         import datetime
@@ -1543,6 +1926,8 @@ class HabitatToolbox(BaseToolbox):
 
         sim = self._sim
         pf  = sim.pathfinder
+        # The pathfinder is what supplies navigable sample points. Without it we could only
+        # teleport to arbitrary coordinates, most of which are inside walls.
         if not getattr(pf, "is_loaded", False):
             print("[scan] pathfinder not loaded — skipping scene scan", flush=True)
             return 0
@@ -1555,9 +1940,11 @@ class HabitatToolbox(BaseToolbox):
         for _ in range(int(n_points)):
             if self._env._episode_over:
                 break
+            # Random navigable point — guaranteed on the floor and reachable, so the frame
+            # is one the robot could actually have taken.
             pt = np.asarray(pf.get_random_navigable_point(), dtype=np.float32)
             if not np.isfinite(pt).all():
-                continue
+                continue   # pathfinder occasionally returns NaN; just resample
             for yaw in yaws:
                 if self._env._episode_over:
                     break
@@ -1600,12 +1987,17 @@ class HabitatToolbox(BaseToolbox):
                 if _RENDER or self._display:
                     self._show_frame(obs)
 
+        # Both flushes are required before the reset: retrieval reads PNGs back from disk,
+        # so every queued frame must be written, and every vector must be in the index,
+        # before the episode proper starts querying them.
         navcap.flush()
         navcap.stop()
         if embedding_worker is not None:
             embedding_worker.flush()
 
-        # Restore the robot to its episode start pose + clean metrics
+        # Restore the robot to its episode start pose + clean metrics.
+        # This is what makes the scan "free": all the teleporting and stepping above is
+        # erased from the task's step count and success metrics, leaving only the memory.
         self.reset_episode()
         print(f"[scan] captured {saved} frames → memory index "
               f"({getattr(embedding_worker, 'embedded', '?')} embedded)", flush=True)
@@ -1661,7 +2053,11 @@ class HabitatToolbox(BaseToolbox):
             return 0
 
         robot = self._robot()
+        # A single floor height for the whole map. The occupancy fusion classifies points as
+        # obstacle-or-floor by their height ABOVE this, and the geodesic queries need a Y to
+        # sit their endpoints at. Single-storey scenes only.
         floor_y = float(robot.base_pos[1])
+        # Size the map to the pathfinder's own bounds, taking X and Z (the floor plane).
         lo, hi = pf.get_bounds()
         omap = OccupancyMap(lo[0], lo[2], hi[0], hi[2], res=res)
         navcap = NavCaptureWorker(out_dir=str(capture_dir))
@@ -1670,7 +2066,10 @@ class HabitatToolbox(BaseToolbox):
         blocked = []                          # frontier targets that stalled nav
         frames = []                           # side-by-side video frames
 
-        # target object(s) to mark (green) on the map panel
+        # target object(s) to mark (green) on the map panel.
+        # PURELY for the debug video — ground-truth object positions, so this must never
+        # feed exploration or memory. It lets a human see whether the explorer is heading
+        # toward the object it will eventually need.
         _tmarks = []
         try:
             _rom0 = sim.get_rigid_object_manager()
@@ -1696,6 +2095,8 @@ class HabitatToolbox(BaseToolbox):
                 for dk in ("agent_0_head_depth", "head_depth", "depth_obs"):
                     if dk in obs:
                         dep = np.asarray(obs[dk]).squeeze().astype(np.float32); break
+                # Depth → greyscale, INVERTED (near = bright) and normalised by max_range,
+                # so the visualisation shows exactly the band the mapper actually fuses.
                 if dep is not None and dep.ndim == 2:
                     g = (255 * (1 - np.clip(dep / max_range, 0, 1))).astype(np.uint8)
                     dep_img = np.stack([g, g, g], axis=-1)
@@ -1719,6 +2120,16 @@ class HabitatToolbox(BaseToolbox):
                 print(f"[explore] video frame failed: {e}", flush=True)
 
         def _geodesic(x0, z0, x1, z1) -> float:
+            """Walking distance between two floor points, respecting walls.
+
+            This is the travel-cost term of the exploration objective, and it must be
+            geodesic rather than straight-line: a frontier 2 m away through a wall is really
+            a 15 m walk around, and Euclidean distance would send the robot chasing it.
+
+            Falls back to Euclidean when no path exists (an unreachable frontier), which
+            makes such candidates look cheap — but they get filtered out later by the
+            navigability check on the sampled viewpoint.
+            """
             sp = habitat_sim.ShortestPath()
             sp.requested_start = np.array([x0, floor_y, z0], dtype=np.float32)
             sp.requested_end = np.array([x1, floor_y, z1], dtype=np.float32)
@@ -1727,7 +2138,12 @@ class HabitatToolbox(BaseToolbox):
             return float(np.hypot(x1 - x0, z1 - z0))
 
         def _fuse_and_capture(obs) -> None:
-            """Fuse one head-depth frame into the map, embed its RGB, record video."""
+            """Fuse one head-depth frame into the map, embed its RGB, record video.
+
+            The workhorse: every frame the explorer takes goes through here, doing double
+            duty — the DEPTH updates the occupancy map that drives exploration, and the RGB
+            goes into episodic memory, which is the actual product of the whole exercise.
+            """
             nonlocal saved
             self._last_obs = obs
             # Use the ACTUAL head-depth camera-to-world from the sim (obs
@@ -1768,7 +2184,12 @@ class HabitatToolbox(BaseToolbox):
                 self._show_frame(obs)
 
         def _observe_and_map() -> None:
-            """Rotate in place through the yaws, mapping/capturing at each."""
+            """Rotate in place through the yaws, mapping/capturing at each.
+
+            A single 90°-FOV frame maps only a narrow wedge, so spinning through four
+            cardinal yaws at every viewpoint gives full 360° coverage from one position —
+            far cheaper than visiting four positions.
+            """
             for yaw in yaws:
                 if self._env._episode_over:
                     break
@@ -1817,6 +2238,15 @@ class HabitatToolbox(BaseToolbox):
                 # Oracle nav can get trapped in a wall/corner and keep rotating
                 # forever. Detect yaw-only or sub-centimetre crawl so exploration
                 # can blacklist this target and try another frontier.
+                #
+                # TWO stall detectors, because there are two distinct pathologies:
+                #  (a) hard stall — the robot is wedged and moves < 5 cm per step for 120
+                #      consecutive steps. Caught by `stagnant_steps` below.
+                #  (b) slow crawl — it inches forward just enough to keep resetting the
+                #      stagnant counter, but covers < 15 cm in 120 steps. Caught by the
+                #      sliding `window_*` check further down.
+                # Progress counts as EITHER moving in the world OR closing the distance to
+                # the goal, so a legitimate detour around furniture isn't punished.
                 moved = float(np.linalg.norm(curr_xy - last_progress_xy))
                 dist_improved = last_progress_dist - final_dist
                 if moved > 0.05 or dist_improved > 0.05:
@@ -1825,6 +2255,8 @@ class HabitatToolbox(BaseToolbox):
                     stagnant_steps = 0
                 else:
                     stagnant_steps += 1
+                # step >= 120 grace period: the oracle legitimately spends the first stretch
+                # turning on the spot to face its path, which looks exactly like a stall.
                 if step >= 120 and stagnant_steps >= 120:
                     print(
                         f"[explore] drive stalled near "
@@ -1868,20 +2300,32 @@ class HabitatToolbox(BaseToolbox):
                 print("[explore] no frontiers left — fully explored", flush=True)
                 break
 
+            # ── Score every candidate frontier: gain − λ·cost ──────────────────
+            # The classic Yamauchi objective. `size` (the frontier's boundary length) is the
+            # information-gain proxy — a long frontier borders a lot of unknown space — and
+            # geodesic distance is the price of going there. λ sets the exchange rate
+            # between "how much I'd learn" and "how far I'd walk".
             rpose = self._get_robot_pose()
             rx, rz = rpose[0], rpose[1]
             best, best_score = None, -float("inf")
             for (wx, wz, size) in clusters[:max_candidates]:
+                # Snap the frontier cell onto the navmesh: the cell itself is a map
+                # abstraction and may not be a place the robot can actually stand.
                 snap = np.asarray(pf.snap_point(
                     np.array([wx, floor_y, wz], dtype=np.float32)), dtype=np.float32)
                 if not np.isfinite(snap).all():
-                    continue
+                    continue   # unreachable — snap_point returns NaN off-navmesh
                 sx, sz = float(snap[0]), float(snap[2])
                 # only skip a candidate that is essentially a viewpoint we already
                 # observed from (avoid exact re-picks / oscillation), not merely
                 # *near* one — frontiers naturally sit close to the explored blob.
+                # Hence the tight 0.5 m radius: a larger one would reject genuinely new
+                # viewpoints just for being adjacent to explored space, which every frontier
+                # is, by definition.
                 if any(math.hypot(sx - vx, sz - vz) < 0.5 for vx, vz in visited):
                     continue
+                # Blacklist radius is larger (1.0 m): if the robot couldn't reach one point,
+                # it almost certainly can't reach its immediate neighbours either.
                 if any(math.hypot(sx - bx, sz - bz) < 1.0 for bx, bz in blocked):
                     continue
                 cost = _geodesic(rx, rz, sx, sz)
@@ -1890,6 +2334,9 @@ class HabitatToolbox(BaseToolbox):
                 if score > best_score:
                     best_score, best = score, (sx, sz, size)
 
+            # Termination: even the best frontier isn't worth the walk. Note this stops on
+            # *diminishing returns*, not on total coverage — the remaining unknown space is
+            # typically slivers behind furniture that cost more to reach than they teach.
             if best is None or best_score < min_gain:
                 print(f"[explore] {len(clusters)} clusters but best score "
                       f"{best_score:.1f} < {min_gain} — stopping at iter {it}", flush=True)

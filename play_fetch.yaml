@@ -1,37 +1,60 @@
-# @package _global_
+# play_fetch.yaml — Habitat config for MANUAL teleoperation of the Fetch robot
+# (interactive_play.py), NOT for running the agent.
+#
+# This is a free-play sandbox: there is no task to succeed at, no reward, and no episode
+# limit. Everything below follows from that. If you are looking for the config the agent
+# actually runs against, it is benchmark/single_agent/fetch_vlm.yaml inside the vendored
+# habitat-lab, loaded (with overrides) by run_habitat.py / run_owmm_embodied.py.
+#
+# @package _global_  — hydra directive: merge these keys at the config root, not nested
+# under this file's own name.
+
+# ── Composition ───────────────────────────────────────────────────────────────
+# Hydra assembles the config from these building blocks. The `@` syntax targets where a
+# group lands, e.g. the `fetch` agent definition is installed at
+# habitat.simulator.agents.main_agent. `_self_` comes LAST so the explicit values in this
+# file override anything the defaults set.
 defaults:
   - /habitat: habitat_config_base
 
   - /habitat/simulator: rearrange_sim
+  # RGB + depth on both the head and the arm cameras.
   - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_head_rgbd_arm_agent
   - /habitat/simulator/agents@habitat.simulator.agents.main_agent: fetch
 
   - /habitat/task: task_config_base
+  # "suction" grip + base motion + "empty" (no task actions) — the action set a human needs.
   - /habitat/task/rearrange/actions: fetch_suction_arm_base_empty
   - /habitat/task/measurements:
     - articulated_agent_force
-    - zero
+    - zero                        # a no-op measure; see reward_measure below
   - /habitat/task/lab_sensors:
-    - joint_sensor
+    - joint_sensor                # arm joint angles, so the teleop UI can display them
 
   - /habitat/dataset/rearrangement: replica_cad
   - _self_
 
 habitat:
   task:
+    # "Empty" task: loads the scene and the robot, defines no goal. There is nothing to
+    # succeed or fail at, which is exactly what free-play wants.
     type: RearrangeEmptyTask-v0
     count_obj_collisions: True
     desired_resting_position: [0.5, 0.0, 1.0]
+    # Both point at the `zero` measure — Habitat REQUIRES a reward and a success measure to
+    # exist, so we give it ones that always return 0 rather than removing them.
     reward_measure: "zero"
     success_measure: "zero"
     render_target: True
     ee_sample_factor: 0.8
+    # No spawn noise: a human wants the robot to start where it started, every time.
     base_angle_noise: 0.0
     base_noise: 0.0
+    # Don't end the session because the operator drove the gripper into a wall.
     constraint_violation_ends_episode: False
     force_regenerate: True
   environment:
-    max_episode_steps: 0
+    max_episode_steps: 0    # 0 == unlimited. Play for as long as you like.
   simulator:
     type: RearrangeSim-v0
     seed: 100
@@ -39,7 +62,9 @@ habitat:
       - "data/objects/ycb/configs/"
     agents:
       main_agent:
-        radius: 0.3
+        radius: 0.3         # navigation footprint
+        # 128×128 on every camera — a quarter the linear resolution the agent runs at (512).
+        # A human just needs to see where the robot is; small buffers keep teleop responsive.
         sim_sensors:
           head_rgb_sensor:
             height: 128
@@ -53,10 +78,14 @@ habitat:
           arm_rgb_sensor:
             height: 128
             width: 128
+    # KINEMATIC mode: the robot moves by teleportation, physics does not simulate its
+    # dynamics, and objects do not respond to it. This makes teleop crisp and unfrustrating —
+    # and it is the OPPOSITE of what the agent runners set (they force kinematic_mode=False,
+    # because for them grasping and dropping must actually be physical).
     kinematic_mode: True
     step_physics: False
-    concur_render: True
+    concur_render: True     # overlap rendering with simulation for a higher frame rate
     habitat_sim_v0:
-      enable_physics: True
+      enable_physics: True  # the engine is up (objects can be placed), it just isn't stepped
   dataset:
     data_path: data/datasets/replica_cad/rearrange/v1/{split}/rearrange_easy.json.gz

@@ -25,6 +25,16 @@ _OVMM = _ROOT / "data" / "datasets" / "ovmm"
 
 
 def _task_text(taskmap: dict, ep_id: int) -> str:
+    """Turn an OVMM episode's category triple into the natural-language task sentence.
+
+    OVMM specifies episodes structurally (object / start receptacle / goal receptacle), but
+    the agent is only ever given a sentence — so this is where the benchmark's structure is
+    flattened into the single string the policy sees. Underscores become spaces because the
+    raw categories are snake_case ("cutting_board") and the model reads prose better.
+
+    Returns "" for an episode with no taskmap entry; the caller skips those rather than
+    training on a task it cannot phrase.
+    """
     t = taskmap.get(str(ep_id))
     if not t:
         return ""
@@ -62,10 +72,19 @@ def main() -> None:
             continue
         rows.append({
             "data_source": f"habitat_ovmm_{args.split}",
+            # Selects HabitatAgentLoop (registered under @register("habitat")) — this is how
+            # verl knows to drive an env server rather than do a single-turn completion.
             "agent_name": args.agent_name,
+            # Vestigial by design. verl's RLHFDataset insists on tokenising a prompt and
+            # applying a length filter, so we give it the task sentence. The REAL prompt is
+            # rendered per-turn by the env server; the agent loop never reads this field.
             "prompt": [{"role": "user", "content": task}],
             "ability": "embodied",
+            # Declares that reward comes from a rule (Habitat's PDDL predicate), not a
+            # learned reward model. No RM is loaded.
             "reward_model": {"style": "rule", "ground_truth": "pddl_success"},
+            # The only field that actually matters: episode_id is what HabitatAgentLoop
+            # sends to /reset. Everything else on this row is scaffolding.
             "extra_info": {"index": len(rows), "episode_id": ep_id, "split": args.split},
         })
         if args.max_episodes and len(rows) >= args.max_episodes:

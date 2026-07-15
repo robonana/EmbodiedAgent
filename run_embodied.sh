@@ -7,6 +7,7 @@
 # DATASET           dataset dir under data/datasets/ (default: train set; use
 #                   sat_TEST_YCB_30scene_head_rgb for the test set)
 
+# Always run from the repo root, whatever directory the script was invoked from.
 cd "$(dirname "$0")"
 
 DATASET=${DATASET:-sat_TRAIN_YCB_30scene_head_rgb}
@@ -17,11 +18,15 @@ DATASET=${DATASET:-sat_TRAIN_YCB_30scene_head_rgb}
 # train default is restricted to the 8 episodes with proper instructions.
 # Override by passing --episode_ids ... as extra args.
 if [ "$DATASET" = "sat_TRAIN_YCB_30scene_head_rgb" ]; then
+    # Note the gaps: 2 and 7 are omitted (see the comment above — no task_prompt.json entry).
     EP_ARGS="--episode_ids 0 1 3 4 5 6 8 9"
 else
     EP_ARGS="--max_episodes 1"
 fi
 
+# Render + step-through are forced on here (unlike run_ovmm_embodied.sh, which lets you
+# override them): this script exists to be WATCHED. Use the runner directly for headless runs.
+# -u keeps the agent's output streaming live.
 HABITAT_RENDER=1 HABITAT_STEP=1 \
 python -u run_owmm_embodied.py \
     --dataset "$DATASET" \

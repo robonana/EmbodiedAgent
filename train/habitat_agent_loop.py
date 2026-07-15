@@ -12,6 +12,16 @@ so the final response_ids are exactly prompt_ids[-len(response_mask):].
 
 Wire it up with rollout.agent.agent_loop_config_path pointing at
 train/agent_loop_config.yaml, which also supplies `env_server_urls`.
+
+Why the two-process split: habitat-sim pins an old Python and its own CUDA/EGL stack, while
+verl wants 3.12 and a completely different torch build. Rather than fight that, the two live
+in separate interpreters and talk over HTTP. That boundary is also why observations arrive as
+base64 JPEGs rather than tensors.
+
+The rest of the file is essentially one long exercise in keeping verl's token bookkeeping
+exactly consistent — the response_mask, the logprobs, and the image blocks all have to line
+up to the token, or training dies deep inside the trainer with an opaque shape error. Most
+of the comments below are about those invariants.
 """
 
 from __future__ import annotations
@@ -58,6 +68,9 @@ def parse_action(text: str) -> Optional[dict]:
     """
     cleaned = text.strip()
 
+    # Strip the reasoning block. Two shapes: the model emitted both tags, or the chat
+    # template already injected the opening <think> into the prompt so only the closer
+    # comes back.
     if "<think>" in cleaned:
         end = cleaned.find("</think>")
         cleaned = (cleaned[end + len("</think>"):] if end != -1
@@ -68,12 +81,17 @@ def parse_action(text: str) -> Optional[dict]:
     if "<tool_call>" in cleaned:
         start = cleaned.find("<tool_call>") + len("<tool_call>")
         end = cleaned.find("</tool_call>")
+        # Unterminated tag (truncated generation): take everything to the end and hope the
+        # JSON is complete.
         cleaned = cleaned[start:end if end != -1 else len(cleaned)].strip()
 
     fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL)
     if fence:
         cleaned = fence.group(1).strip()
 
+    # Outermost braces. Unlike the gemini_client version (which brace-matches), this takes
+    # first '{' to last '}' — cruder, but the training policy's output is not worth a
+    # careful parse, and a mis-parse is scored as an invalid action rather than crashing.
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -86,11 +104,14 @@ def parse_action(text: str) -> Optional[dict]:
 
 
 def _decode_images(obs: dict) -> list[Image.Image]:
+    """base64 JPEG (over the wire) → PIL. A failed decode drops that one image."""
     out = []
     for item in obs.get("images", []):
         try:
             out.append(Image.open(io.BytesIO(base64.b64decode(item["b64"]))).convert("RGB"))
         except Exception as exc:
+            # WARNING, not raise: losing an image de-tunes the turn but a dead rollout
+            # poisons the whole training batch.
             logger.warning("failed to decode observation image: %s", exc)
     return out
 
@@ -209,6 +230,11 @@ class HabitatAgentLoop(AgentLoopBase):
     # ── HTTP ─────────────────────────────────────────────────────────────────
 
     async def _post(self, session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
+        """POST and unwrap, turning any non-200 into an exception with the server's body.
+
+        The body matters: the env server puts the actual Habitat error in it, and without it
+        a failed step is just an opaque 500.
+        """
         async with session.post(url, json=payload) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"{url} -> HTTP {resp.status}: {await resp.text()}")
@@ -297,10 +323,13 @@ class HabitatAgentLoop(AgentLoopBase):
 
             try:
                 for _ in range(self.max_turns):
+                    # ── 1. Generate one assistant turn ────────────────────────
                     remaining = self.response_length - len(response_mask)
                     if remaining <= 0:
                         truncated = True
                         break
+                    # Two caps at once: never exceed the total response budget, and never
+                    # let a single turn run away (see max_turn_tokens in __init__).
                     turn_params = {**sampling_params,
                                    "max_tokens": min(remaining, self.max_turn_tokens)}
                     output = await self.server_manager.generate(
@@ -309,6 +338,9 @@ class HabitatAgentLoop(AgentLoopBase):
                         sampling_params=turn_params,
                         image_data=images or None,
                     )
+                    # prompt_ids is the running FULL sequence; response_ids is recovered at
+                    # the end by slicing off the original prompt. mask=1 ⇒ these are the
+                    # policy's own tokens, i.e. the ones that get gradient.
                     prompt_ids += output.token_ids
                     response_mask += [1] * len(output.token_ids)
                     if output.log_probs:
@@ -319,10 +351,13 @@ class HabitatAgentLoop(AgentLoopBase):
                         extra_fields["max_global_steps"] = output.extra_fields["max_global_steps"]
                     assistant_turns += 1
 
+                    # Budget exhausted by the generation itself — stop before stepping the
+                    # env, since we could not represent the resulting observation anyway.
                     if len(response_mask) >= self.response_length:
                         truncated = True
                         break
 
+                    # ── 2. Parse the action out of the generated text ─────────
                     text = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
                     action = parse_action(text)
 
@@ -335,6 +370,11 @@ class HabitatAgentLoop(AgentLoopBase):
                                 f"parsed={action is not None}\n"
                                 f"--- head ---\n{raw[:600]}\n--- tail ---\n{raw[-400:]}\n")
 
+                    # ── 3. Step the environment ───────────────────────────────
+                    # `action or {}` — an unparseable generation still steps the env, which
+                    # scores it as an invalid action. That is deliberate: the policy must
+                    # feel a reward penalty for emitting garbage, and skipping the step would
+                    # make malformed output free.
                     step = await self._post(session, f"{url}/step",
                                             {"session_id": session_id, "action": action or {}})
                     total_reward += float(step["reward"])
@@ -344,21 +384,29 @@ class HabitatAgentLoop(AgentLoopBase):
                         released = True   # the server frees itself on episode end
                         break
 
+                    # ── 4. Append the observation as *non-gradient* tokens ────
                     next_obs = step["observation"]
                     new_images = _decode_images(next_obs)
                     env_ids = await self.apply_chat_template(
                         [_user_message(next_obs)],
                         images=new_images or None,
-                        remove_system_prompt=True,
+                        remove_system_prompt=True,   # the system turn is already in prompt_ids
                     )
                     env_ids = self.turn_separator + env_ids
 
+                    # Check BEFORE appending. Appending an observation that overflows would
+                    # get sliced by the cap, potentially through the middle of an image
+                    # block — the exact corruption _cap_at_image_boundary exists to undo.
                     if len(response_mask) + len(env_ids) >= self.response_length:
                         truncated = True
                         break
 
                     prompt_ids += env_ids
+                    # mask=0 ⇒ environment tokens. They condition the next generation but
+                    # must NOT receive gradient — the policy didn't write them.
                     response_mask += [0] * len(env_ids)
+                    # Padding logprobs keeps this array the same length as the mask, which
+                    # the trainer requires.
                     if response_logprobs:
                         response_logprobs += [0.0] * len(env_ids)
                     images.extend(new_images)
@@ -369,6 +417,9 @@ class HabitatAgentLoop(AgentLoopBase):
                 if not released:
                     await self._release(session, url, session_id)
 
+        # Recover the response by slicing the original prompt off the running sequence. The
+        # assert pins the loop's core invariant: every token appended to prompt_ids after
+        # prompt_len got exactly one mask entry (1 for assistant, 0 for observation).
         response_ids = prompt_ids[prompt_len:]
         assert len(response_ids) == len(response_mask), (
             f"token/mask mismatch: {len(response_ids)} vs {len(response_mask)}")
@@ -384,6 +435,7 @@ class HabitatAgentLoop(AgentLoopBase):
             response_logprobs=response_logprobs if response_logprobs else None,
             multi_modal_data={"images": images} if images else None,
             reward_score=total_reward,
+            # verl counts every message: 1 system + (assistant + observation) per turn.
             num_turns=assistant_turns * 2 + 1,
             metrics=AgentLoopMetrics(**metrics),
             extra_fields={

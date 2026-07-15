@@ -15,6 +15,20 @@ Prereqs (one-time):
 Usage (from EmbodiedAgent/ root, habitat conda env active):
     python run_ovmm_embodied.py --split minival --episode_ids 0
     python run_ovmm_embodied.py --split minival --max_episodes 3 --max_agent_steps 40
+
+ARCHITECTURE — this file is a set of MONKEY-PATCHES, not a standalone runner.
+
+run_owmm_embodied.py owns the whole per-episode pipeline (build env → scan/explore → run the
+agent loop → collect PDDL metrics), and it reads three things through module-level hooks:
+
+    base._task_prompt            what is the task sentence for this episode?
+    base._build_episode_config   how do I build a Habitat config for it?
+    base._prepopulate_memory     is there pre-collected scene memory to load?
+
+OVMM differs from OWMM in exactly those three respects, so this module replaces those three
+functions and calls base._run_episode. That is also why `import run_ovmm_embodied` is enough to
+switch the OWMM runner into OVMM mode — the patches apply at import time — which is precisely
+how train/habitat_env_server.py uses it.
 """
 from __future__ import annotations
 
@@ -29,6 +43,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
+# Line-buffer stdout: importing habitat takes ~30 s, and without this the "starting" banner
+# sits in the pipe buffer and the run looks hung.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -38,10 +54,14 @@ import run_owmm_embodied as base  # reuse _import_habitat, _run_episode, path se
 
 _HERE = Path(__file__).resolve().parent
 _OVMM_DIR = _HERE / "data" / "datasets" / "ovmm"
+# Habitat's dataset loader takes a FILE, not an episode id, so running one episode means
+# writing a one-episode dataset. These scratch files land here. See _write_single_episode.
 _SINGLE_DIR = _OVMM_DIR / "_single"
 _RENDER = os.environ.get("HABITAT_RENDER", "0") == "1"
 
-# task map (episode_id -> categories), loaded per split
+# task map (episode_id -> categories), loaded per split.
+# Module-global because _ovmm_task_prompt is installed as a hook on `base` and is called from
+# inside base._run_episode, which has no way to pass it in.
 _TASKMAP: Dict[str, Dict[str, str]] = {}
 
 
@@ -59,6 +79,12 @@ def _all_episode_ids(split: str) -> List[int]:
 
 
 def _is_transform4x4(value: Any) -> bool:
+    """True for an inline 4×4 matrix; False for the raw OVMM form (an int index).
+
+    This is the shape convert_ovmm_episodes.py produces. An int here means the dataset was
+    NOT converted (or was converted by an older version), which Habitat would only discover
+    much later, deep inside object instantiation, with an unhelpful error.
+    """
     return (
         isinstance(value, list)
         and len(value) == 4
@@ -67,7 +93,12 @@ def _is_transform4x4(value: Any) -> bool:
 
 
 def _validate_inline_transforms(split: str, episode_ids: List[int]) -> None:
-    """Catch stale OVMM conversions before Habitat crashes in _add_objs."""
+    """Catch stale OVMM conversions before Habitat crashes in _add_objs.
+
+    A fail-fast guard whose entire purpose is a better error message: without it, a stale
+    dataset surfaces as an opaque crash inside habitat's _add_objs after a 30-second scene
+    load. Here it becomes "regenerate with: python tools/convert_ovmm_episodes.py <split>".
+    """
     wanted = {int(ep_id) for ep_id in episode_ids}
     d = json.load(gzip.open(_OVMM_DIR / f"{split}.json.gz"))
     bad: list[tuple[int, str]] = []
@@ -119,10 +150,15 @@ def _write_single_episode(split: str, ep_id: int, drop_missing: bool = True):
                 f"{transform!r}; regenerate with: "
                 f"python tools/convert_ovmm_episodes.py {split}"
             )
+    # The OVMM_objects asset mirror is enormous and often incompletely downloaded. Rather than
+    # refuse to run, drop the CLUTTER objects whose configs are missing — but never the target,
+    # which is kept unconditionally even if its asset is absent (better to fail loudly on the
+    # object the task is actually about than to silently run a task with no target in it).
+    # The episode is still runnable; it is just less cluttered, hence the fidelity warning.
     n_dropped = 0
     if drop_missing:
         present = _present_configs(ep["additional_obj_config_paths"])
-        tgt_keys = {k.split("_:")[0] for k in ep["targets"].keys()}
+        tgt_keys = {k.split("_:")[0] for k in ep["targets"].keys()}   # strip instance suffix
         kept = []
         for ro in ep["rigid_objs"]:
             base = os.path.basename(ro[0])
@@ -131,6 +167,8 @@ def _write_single_episode(split: str, ep_id: int, drop_missing: bool = True):
                 kept.append(ro)
             else:
                 n_dropped += 1
+        # Copy before mutating — `d` is the shared full-split dict and other episodes still
+        # reference it.
         ep = dict(ep); ep["rigid_objs"] = kept
     out = dict(d); out["episodes"] = [ep]
     _SINGLE_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,9 +184,16 @@ def _write_single_episode(split: str, ep_id: int, drop_missing: bool = True):
 
 
 def _ovmm_task_prompt(ep_id: int) -> str:
+    """HOOK (replaces base._task_prompt): the task sentence for an OVMM episode.
+
+    OVMM specifies tasks structurally (object / start receptacle / goal receptacle); the agent
+    only ever receives prose. This is where that flattening happens — and it must produce the
+    SAME sentence as train/prepare_habitat_dataset.py::_task_text, or the RL policy would be
+    trained on differently-worded tasks than it is evaluated on.
+    """
     t = _TASKMAP.get(str(ep_id))
     if not t:
-        return ""
+        return ""   # caller falls back to deriving one from the episode
     obj = t["object_category"].replace("_", " ")
     src = t["start_recep_category"].replace("_", " ")
     dst = t["goal_recep_category"].replace("_", " ")
@@ -168,18 +213,27 @@ def _ovmm_build_episode_config(ep_id: int, args, get_config):
     data_path, ep = _write_single_episode(args.split, ep_id,
                                            drop_missing=not args.no_drop_missing)
     obj_dirs = "[" + ",".join(ep["additional_obj_config_paths"]) + "]"
+    # Hydra override syntax: `key=value` sets, and a leading `~` DELETES a config node.
     overrides = [
         f"habitat.dataset.data_path={data_path}",
+        # The stock fetch_vlm object dirs hold none of OVMM's HSSD/amazon/google assets.
         f"habitat.simulator.additional_object_paths={obj_dirs}",
+        # Delete three RL sensors. They exist to feed a trained policy a vector to the target,
+        # they mis-size on OVMM episodes, and this agent never reads them (it works from RGB,
+        # depth and localization). They would also be ground-truth leakage if it did.
         "~habitat.task.lab_sensors.target_start_gps_compass_sensor",
         "~habitat.task.lab_sensors.target_goal_gps_compass_sensor",
         "~habitat.task.lab_sensors.object_to_goal_distance_sensor",
-        f"habitat.seed={ep_id}",
+        f"habitat.seed={ep_id}",       # deterministic per episode
+        # Real physics, not kinematic: objects must actually fall when released and be held by
+        # contact. The benchmark defaults to kinematic for speed. (Compare the fix-ups in
+        # HabitatToolbox._force_dynamic_scene_objects and _settle_release_physics.)
         "habitat.simulator.kinematic_mode=False",
         "habitat.simulator.step_physics=True",
         f"habitat.simulator.habitat_sim_v0.gpu_device_id={args.gpu_id}",
     ]
     cfg = get_config("benchmark/single_agent/fetch_vlm.yaml", overrides=overrides)
+    # The third-person camera is only worth its render cost when someone is watching.
     if _RENDER or args.display:
         from run_habitat import _add_third_person_sensor
         _add_third_person_sensor(cfg)
@@ -187,10 +241,18 @@ def _ovmm_build_episode_config(ep_id: int, args, get_config):
 
 
 def _no_prepopulate(ep_id, embedding_worker, episodic_memory):
+    """HOOK (replaces base._prepopulate_memory): OVMM ships no pre-collected scene images.
+
+    OWMM provides 8 hand-picked scene-graph images per episode; OVMM provides none. A no-op
+    here means base._run_episode falls through to its scan/explore path, so the agent builds
+    its own memory by looking around — which is the more honest setup anyway.
+    """
     pass  # OVMM has no pre-collected scene-graph images; always auto-scan
 
 
 # ── Patch base runner hooks so base._run_episode does OVMM work ──────────────
+# Executed at IMPORT time, so merely importing this module switches the OWMM runner into OVMM
+# mode. train/habitat_env_server.py relies on exactly that.
 base._task_prompt = _ovmm_task_prompt
 base._build_episode_config = _ovmm_build_episode_config
 base._prepopulate_memory = _no_prepopulate
@@ -279,6 +341,9 @@ def main():
     print(f"[run_ovmm_embodied] split={args.split} {len(episode_ids)} episodes "
           f"model={args.vlm_model}", flush=True)
 
+    # ORDER IS CRITICAL: the pygame display must be forked BEFORE habitat-sim is imported.
+    # habitat-sim initialises EGL in this process, which is incompatible with a child that
+    # wants GLX/X11. See the note at the top of sim/habitat_toolbox.py.
     if _RENDER:
         from sim.habitat_toolbox import start_display_process
         start_display_process()
@@ -291,6 +356,9 @@ def main():
 
     records: List[Dict[str, Any]] = []
     for ep_id in episode_ids:
+        # base._run_episode is the shared pipeline; the hooks patched above are what make it
+        # do OVMM work. One episode crashing must not lose the whole sweep — record the error
+        # and carry on (Ctrl-C, by contrast, stops immediately and still writes results).
         try:
             record = base._run_episode(ep_id, args, get_config, HabEnv)
         except KeyboardInterrupt:
@@ -299,6 +367,8 @@ def main():
         except Exception as exc:
             print(f"[ep {ep_id}] fatal: {exc}", flush=True)
             traceback.print_exc()
+            # The error record still counts in the denominator below, so a crashing episode
+            # scores as a failure rather than quietly vanishing from the success rate.
             record = {"episode_id": ep_id, "error": str(exc), "framework": "embodied-ovmm"}
         records.append(record)
 

@@ -8,6 +8,12 @@ and GEMINI_API_KEY (or GOOGLE_API_KEY) is set.
 Usage:
     python run_h12_mcp.py --task "open the drawer"
     python run_h12_mcp.py --server_url http://127.0.0.1:8000/mcp --max_agent_steps 20
+
+The shortest runner in the repo, and that is the point it makes: driving a completely different
+robot (a real H1-2 humanoid behind a ROS stack, rather than a simulator) takes ~40 lines,
+because MCPToolbox satisfies the same ToolboxProtocol and PromptEmbodiedAgent neither knows
+nor cares what is on the other side of it. No simulator, no memory stack, no scene scan — just
+a toolbox, a VLM, and the agent loop.
 """
 import argparse
 import json
@@ -29,15 +35,21 @@ def main():
     p.add_argument("--log_dir", default="runs/h12_mcp")
     args = p.parse_args()
 
+    # Fail before touching the robot if the key is missing — a half-started episode on real
+    # hardware is worse than not starting.
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise SystemExit("Set GEMINI_API_KEY (or GOOGLE_API_KEY).")
 
+    # Fresh log dir each run: images are numbered from 1, so leftovers from a previous run
+    # would interleave with this one's.
     log_dir = Path(args.log_dir)
     if log_dir.exists():
         shutil.rmtree(log_dir, ignore_errors=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # The three pieces, assembled. Note the toolbox is constructed with just a URL — MCPToolbox
+    # connects on construction and everything downstream is protocol-identical to a sim run.
     gemini = GeminiClient(api_key=api_key, model_name=args.gemini_model, log_dir=str(log_dir))
     toolbox = MCPToolbox(server_url=args.server_url, log_dir=str(log_dir))
     agent = PromptEmbodiedAgent(
@@ -47,6 +59,9 @@ def main():
         max_agent_steps=args.max_agent_steps,
     )
 
+    # The finally is load-bearing: MCPToolbox holds a live session plus a background asyncio
+    # thread. Without close(), a crashed episode leaves the server's session claimed and the
+    # process hanging on a non-daemon loop.
     try:
         result = agent.run(task=args.task) or {}
     finally:

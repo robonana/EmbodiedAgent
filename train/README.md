@@ -204,6 +204,12 @@ One rollout is one simulated episode. A GRPO step costs
 * the scene scan runs **once per episode** and is snapshotted; later rollouts restore
   the post-scan episodic memory + FAISS index instead of rescanning.
 
+The snapshot is only reused when its FAISS index is **valid and non-empty**
+(`_snapshot_valid`): a run that crashes mid-scan (e.g. an OOM) used to leave an
+empty `_post_scan/index`, and because the directory existed, `first_build` stayed
+False forever — the scan never re-ran and every `retrieve_memory` returned ~1 stale
+frame regardless of `top_k`. An invalid snapshot is now discarded and re-scanned.
+
 A cold episode reset (scene load + scan) is minutes; a warm one is seconds. Ordering
 the batch so rollouts of the same episode land on the same server is not implemented
 — the pool hands out whichever server is free.

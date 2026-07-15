@@ -2,6 +2,33 @@
 agent/prompts.py — System and policy prompts for PromptEmbodiedAgent.
 
 Keep prompts compact enough for repeated loop calls (~1k tokens each).
+
+Everything the agent "knows how to do" lives here — this file *is* the policy, in the
+same sense that a network's weights are the policy in a learned system. Since there is
+no training, the only levers on behaviour are the tool descriptions, the decision rules,
+and the shape of the per-step context. Two prompts are sent per step:
+
+  SYSTEM_PROMPT       constant across the whole episode (so it caches well on the
+                      provider side): the robot's capabilities, the tool catalogue, the
+                      output schema, and the decision rules.
+  build_policy_prompt rebuilt every step: the task, the current state, the running
+                      progress narrative, and what the last action actually did.
+
+Two smaller prompts serve the *nested* VLM calls made while executing a tool:
+build_visual_inspection_prompt (backs `inspect`) and build_memory_rerank_prompt (the
+precision stage of `retrieve_memory`).
+
+Prompt-engineering notes, for anyone tempted to edit the text below:
+  * Each tool is documented with Use-when / Do-not-use-when / Rules / Example. The
+    negative cases ("do not use when") do more work than the positive ones — they are
+    what stop the model reaching for `manipulate` from across the room.
+  * The mandated JSON key *order* (verification → analysis → rationale → tool → args →
+    expectation) makes the model reason before it acts, because autoregressive decoding
+    means earlier keys condition later ones. Reordering these keys measurably degrades
+    action quality; it is not cosmetic.
+  * The filename ⇄ memory_id convention is spelled out explicitly because the model
+    otherwise wastes steps re-running retrieve_memory just to recover an id it already
+    has.
 """
 
 from __future__ import annotations
@@ -11,6 +38,10 @@ from typing import Any, Optional
 
 
 # ── System prompt (sent once per episode as the "system" turn) ────────────────
+# Constant for the whole episode. Sections, in order: role/environment, camera setup,
+# output format, the 9-tool catalogue, the output schema, then the three rule blocks
+# (previous-action verification, progress analysis, decision rules) that govern the
+# chain-of-thought fields.
 
 SYSTEM_PROMPT = """\
 You are an embodied AI agent controlling a mobile manipulator in an indoor environment.
@@ -407,9 +438,23 @@ def build_policy_prompt(
     last_result: Optional[dict[str, Any]] = None,
     repeat_warning: Optional[str] = None,
 ) -> str:
+    """Build the per-step user turn: everything about *now* that the system prompt can't know.
+
+    Assembled as a list of lines and joined once, which keeps the conditional sections
+    (memory, last result, warning) easy to add without threading string concatenation
+    through branches.
+
+    Note what is *not* here: no raw step-by-step history of every past action. The model's
+    own `progress_analysis` entries (transient_memory) serve that role in compressed form,
+    and the full history is available on demand via the `retrieve_trajectory` tool. That
+    keeps per-step context roughly constant instead of growing linearly with episode length.
+    """
     obs = current_observation or {}
 
     # ── Task / step header ────────────────────────────────────────────────────
+    # The step counter and clock are load-bearing, not decoration: the model uses the
+    # timestamp to construct time_from/time_to windows for retrieve_memory and
+    # retrieve_trajectory, and the step number to gauge its remaining budget.
     lines = [
         f"TASK: {task}",
         f"STEP: {step_idx}  TIME: {timestamp}",
@@ -420,6 +465,10 @@ def build_policy_prompt(
     lines.append(f"  pose: {obs.get('robot_pose', 'unknown')}")
 
     # ── Current image ─────────────────────────────────────────────────────────
+    # The pixels are attached separately by the client (see call_policy); this only names
+    # the file. Naming it matters: the model must echo this exact path back as the
+    # `image_path` argument to detect/inspect, and it copies it from here rather than
+    # inventing one.
     img_path   = obs.get("image_path", "")
     if img_path:
         lines += ["", f"CURRENT HEAD-CAMERA IMAGE (forward-facing): {img_path}  "
@@ -428,6 +477,10 @@ def build_policy_prompt(
         lines += ["", "CURRENT HEAD-CAMERA IMAGE: [attached — examine carefully]"]
 
     # ── Episode transient memory ──────────────────────────────────────────────
+    # The model's own progress_analysis from every previous step, numbered in order. This
+    # is the agent's working memory across the episode. The explicit "no steps yet" branch
+    # (rather than omitting the section) tells the model unambiguously that it is at the
+    # start — otherwise a missing section reads as "history withheld".
     lines += [""]
     if transient_memory:
         lines.append(f"EPISODE TRANSIENT MEMORY ({len(transient_memory)} steps):")
@@ -437,6 +490,9 @@ def build_policy_prompt(
         lines.append("EPISODE TRANSIENT MEMORY: (no steps yet — this is the first action)")
 
     # ── Last tool result ──────────────────────────────────────────────────────
+    # The action/outcome pair the model must verify this step. Both halves are needed:
+    # `expected_progress` is what it *predicted*, and the result is what *happened* —
+    # the verification field is precisely the comparison of the two.
     if last_action or last_result:
         lines += ["", "LAST TOOL RESULT:"]
         if last_action:
@@ -448,6 +504,8 @@ def build_policy_prompt(
             if last_action.get("rationale"):
                 lines.append(f"  rationale: {last_action['rationale']}")
             lines.append(f"  tool: {last_action.get('tool', '?')}")
+            # Compact separators: this is machine-ish content the model only needs to
+            # read, so we don't spend tokens on pretty-printing whitespace.
             args_str = json.dumps(last_action.get("arguments", {}), separators=(",", ":"))
             lines.append(f"  arguments: {args_str}")
             if last_action.get("expected_progress"):
@@ -455,6 +513,9 @@ def build_policy_prompt(
         if last_result:
             lines.append(f"  ok: {last_result.get('ok')}")
             lines.append(f"  summary: {last_result.get('summary', '')}")
+            # The full data payload, uncut — detections, memory candidates with their
+            # memory_ids and poses, ground-truth grasp state. `default=str` so a stray
+            # numpy scalar or Path can't blow up prompt construction mid-episode.
             data = last_result.get("data")
             if data:
                 lines.append(f"  data: {json.dumps(data, default=str)}")
@@ -463,14 +524,28 @@ def build_policy_prompt(
                 lines.append(f"  image_paths: {img_paths}")
 
     # ── Repeat warning ────────────────────────────────────────────────────────
+    # Injected by the agent loop once the same action has been issued 3+ times. Placed
+    # last, right before the output instruction, where it is hardest to ignore.
     if repeat_warning:
         lines += ["", f"!! WARNING: {repeat_warning}"]
 
+    # Restate the output contract at the very end — recency helps, and it is the single
+    # instruction whose violation costs the whole step.
     lines += ["", "Output exactly one <tool_call>...</tool_call> block."]
     return "\n".join(lines)
 
 
 def build_visual_inspection_prompt(question: str) -> str:
+    """Prompt for the nested `inspect` VLM call (see GeminiClient.inspect_image).
+
+    Deliberately tiny — this call answers one visual question and has no notion of the
+    task, the tools, or the episode. The JSON skeleton is shown inline (rather than
+    described) because a literal example is the most reliable way to pin the schema:
+      answer           free-text response to the question
+      evidence         what in the image supports it (discourages confident guessing)
+      confidence       0-1, so the policy can discount a shaky answer
+      candidate_bboxes optional regions worth a follow-up inspect
+    """
     return (
         f"Examine this image carefully.\n"
         f"Question: {question}\n\n"
@@ -485,6 +560,25 @@ def build_memory_rerank_prompt(
     candidate_metadata: list[dict],
     is_image_query: bool = False,
 ) -> str:
+    """Prompt for the VLM rerank stage of `retrieve_memory`.
+
+    Embedding search (FAISS) supplies recall — it finds frames that *look like* the query,
+    which routinely means the right room but the wrong shelf. This prompt asks the VLM for
+    precision: look at every candidate frame and rank them by whether the target is
+    actually visible and reachable.
+
+    Two design choices worth flagging:
+      * We ask for a per-candidate `object_location` + `confidence` *before* the ranking.
+        Forcing the model to commit to an observation about each frame stops it from
+        rubber-stamping the embedding order it was handed.
+      * `ranked_ids` must contain every id exactly once, so the result is a permutation
+        we can trust rather than a subset the model felt like mentioning.
+
+    The caller attaches the images in the same order as `candidate_metadata`, captioned
+    "Candidate N image" to match the numbering generated here.
+    """
+    # Numbered metadata block. The numbering (1-based) is what ties each text entry to
+    # its attached image; memory_id ties it back to the store.
     lines = []
     for i, c in enumerate(candidate_metadata):
         lines.append(
@@ -495,8 +589,13 @@ def build_memory_rerank_prompt(
         )
     meta = "\n".join(lines)
     n = len(candidate_metadata)
+    # Pre-filled into the JSON skeleton below as a template, which both shows the exact
+    # id spelling and makes "list every id exactly once" concrete rather than abstract.
     ids = [c.get("memory_id") for c in candidate_metadata]
 
+    # retrieve_memory accepts either a text query or an image path as the query. In the
+    # image case the query image is attached above the candidates, so the prompt must
+    # point at it rather than at a (meaningless) file path string.
     if is_image_query:
         query_line = "QUERY: image (see Query image attached above)\n\n"
         query_desc = "the query image shown above"
@@ -504,6 +603,9 @@ def build_memory_rerank_prompt(
         query_line = f"QUERY: {query}\n\n"
         query_desc = f"'{query}'"
 
+    # "The images are uncertain — the target may or may not be visible" is deliberate:
+    # without it the model assumes retrieval succeeded and confabulates the target into
+    # whichever frame scored highest.
     return (
         f"{query_line}"
         f"Below are {n} memory candidates retrieved by embedding similarity, "

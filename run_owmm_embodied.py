@@ -16,6 +16,22 @@ Usage (from EmbodiedAgent/ root, with habitat conda env active):
     python run_owmm_embodied.py --episode_ids 1043 1245 2116 --max_agent_steps 40
     python run_owmm_embodied.py --all_episodes --max_agent_steps 40
     python run_owmm_embodied.py --max_episodes 10   # first N from test_episode_id.txt
+
+THE BASE RUNNER. Besides serving the OWMM benchmark itself, this module owns the per-episode
+pipeline that run_ovmm_embodied.py and train/habitat_env_server.py both reuse:
+
+    _run_episode()  build env → build memory (scan / explore / pre-populate) → build toolbox
+                    → run PromptEmbodiedAgent → collect PDDL metrics
+
+Three functions are treated as HOOKS — module-level names that other runners REBIND to change
+the benchmark without touching the pipeline:
+
+    _task_prompt(ep_id)                     the task sentence
+    _build_episode_config(ep_id, ...)       the Habitat config
+    _prepopulate_memory(ep_id, ...)         pre-collected scene memory, if any
+
+They must therefore be looked up through the module (`base._task_prompt(...)`) rather than
+captured at import; see run_ovmm_embodied.py for the patching side of the contract.
 """
 from __future__ import annotations
 
@@ -37,6 +53,9 @@ print("[run_owmm_embodied] starting …", flush=True)
 import numpy as np
 
 # ── Path injection ────────────────────────────────────────────────────────────
+# The habitat-lab FORK vendored under OWMM-Agent/ is not pip-installed, and it must SHADOW any
+# installed habitat — it carries the OWMM task/sensor registrations and the ArmAction changes
+# this agent depends on. Hence sys.path.insert(0, …) rather than append.
 _HERE      = Path(__file__).resolve().parent
 _OWMM_ROOT = _HERE / "OWMM-Agent" / "sim" / "habitat-lab"
 _HAB_LAB   = str(_OWMM_ROOT / "habitat-lab")
@@ -65,10 +84,13 @@ def _set_dataset(name: str) -> None:
 # ── Dataset helpers ───────────────────────────────────────────────────────────
 
 def _load_episode_ids(args) -> List[int]:
+    """Which episodes to run: explicit list, else the dataset's id file, else infer from disk."""
     if args.episode_ids:
         return [int(x) for x in args.episode_ids]
     # Prefer an explicit id list file (test_/train_episode_id.txt); otherwise
     # (e.g. the train set ships none) derive ids from the extracted image/ dirs.
+    # The directory scan is the fallback because episode data is laid out one directory per
+    # episode, NAMED for its id — so the filesystem is itself an index.
     ids: List[int] = []
     for fname in ("test_episode_id.txt", "train_episode_id.txt", "episode_id.txt"):
         txt = _OWMM_DATASET_ROOT / fname
@@ -87,11 +109,13 @@ def _load_episode_ids(args) -> List[int]:
 
 
 def _task_prompt(ep_id: int) -> str:
-    """Read natural-language task description from the dataset's task_prompt.json.
+    """HOOK. Read natural-language task description from the dataset's task_prompt.json.
 
     Returns "" when there is no entry (e.g. the train set ships no
     task_prompt.json) — the caller then derives the task from the loaded
     Habitat PDDL episode instead.
+
+    Rebound by run_ovmm_embodied.py to build the sentence from OVMM's category triple.
     """
     # task_prompt.json lives at .../<dataset>/image/task_prompt.json
     task_json = _OWMM_DATASET_ROOT / "image" / "task_prompt.json"
@@ -103,7 +127,12 @@ def _task_prompt(ep_id: int) -> str:
 
 
 def _scene_graph_images(ep_id: int) -> List[Path]:
-    """Return ordered list of pre-collected scene graph image paths for this episode."""
+    """Return ordered list of pre-collected scene graph image paths for this episode.
+
+    The 8 images OWMM-Agent hands its VLM as a fixed prompt: two views that matter (the
+    target's receptacle and the goal's) plus six random scene views. The order is fixed and
+    meaningful, so it is spelled out rather than globbed. Missing files are skipped.
+    """
     ep_dir = _OWMM_DATASET_ROOT / "image" / str(ep_id)
     names = [
         "target_rec.png", "goal_rec.png",
@@ -117,6 +146,17 @@ def _scene_graph_images(ep_id: int) -> List[Path]:
 # ── Habitat helpers ───────────────────────────────────────────────────────────
 
 def _import_habitat():
+    """Import habitat and return (get_config, Env).
+
+    Deferred into a function rather than done at module import for two reasons: it takes tens
+    of seconds, and it must not happen until AFTER the pygame display subprocess has been
+    forked (habitat-sim's EGL init is incompatible with forking a GLX child afterwards).
+
+    The inner imports are purely for their REGISTRATION side effects — they populate habitat's
+    global task/sensor/action registries with the rearrange task and OWMM's custom sensors, and
+    are never referenced by name. Wrapped in try/except so a config that needs none of them
+    still runs.
+    """
     import habitat  # noqa — triggers registration
     from habitat.config.default import get_config
     from habitat.core.env import Env
@@ -130,10 +170,13 @@ def _import_habitat():
 
 
 def _build_episode_config(ep_id: int, args, get_config):
-    """Create a Habitat config pointing to this episode's scene_graph.gz.
+    """HOOK. Create a Habitat config pointing to this episode's scene_graph.gz.
 
     Must be called with cwd = OWMM-Agent/sim/habitat-lab so that Hydra's
     relative config search paths resolve correctly.
+
+    Rebound by run_ovmm_embodied.py, which additionally points the object paths at OVMM's
+    assets and deletes the RL sensors.
     """
     # data_path is relative to cwd (OWMM-Agent/sim/habitat-lab)
     data_path = (
@@ -142,7 +185,9 @@ def _build_episode_config(ep_id: int, args, get_config):
     )
     overrides = [
         f"habitat.dataset.data_path={data_path}",
-        f"habitat.seed={ep_id}",
+        f"habitat.seed={ep_id}",     # deterministic per episode
+        # Real physics: objects must fall when released and be held by contact. The benchmark
+        # config defaults to kinematic for speed, which would make manipulation cosmetic.
         "habitat.simulator.kinematic_mode=False",
         "habitat.simulator.step_physics=True",
         f"habitat.simulator.habitat_sim_v0.gpu_device_id={args.gpu_id}",
@@ -150,7 +195,8 @@ def _build_episode_config(ep_id: int, args, get_config):
     # fetch_vlm.yaml lives in habitat-lab's benchmark config dir
     cfg = get_config("benchmark/single_agent/fetch_vlm.yaml", overrides=overrides)
 
-    # Inject a third-person camera when rendering is enabled
+    # Inject a third-person camera when rendering is enabled (it costs a render pass, so only
+    # add it when a human is actually going to look at it).
     if _RENDER or args.display:
         from run_habitat import _add_third_person_sensor
         _add_third_person_sensor(cfg)
@@ -162,10 +208,17 @@ def _build_episode_config(ep_id: int, args, get_config):
 
 def _prepopulate_memory(ep_id: int, embedding_worker, episodic_memory):
     """
-    Pre-index the 8 OWMM pre-collected scene graph images into FAISS.
+    HOOK. Pre-index the 8 OWMM pre-collected scene graph images into FAISS.
 
     This gives EmbodiedAgent the same scene-level knowledge that OWMM-Agent
     encodes in its 8-image prompt, but accessible via retrieve_memory() tool.
+
+    That difference is the fair-comparison argument: OWMM force-feeds all 8 images into every
+    prompt, while here they go into MEMORY and the agent must decide to retrieve them. Same
+    information, actively rather than passively supplied.
+
+    Rebound to a no-op by run_ovmm_embodied.py — OVMM ships no such images, so that agent
+    scans the scene for itself.
     """
     from PIL import Image
     from agent.schemas import MemoryEntry, MemorySource, SensorData, EmbeddingRefs
@@ -177,6 +230,10 @@ def _prepopulate_memory(ep_id: int, embedding_worker, episodic_memory):
             continue
         try:
             rgb = np.array(Image.open(img_path).convert("RGB"))
+            # Pose is ZERO for all of these — the dataset ships the images without the camera
+            # poses they were taken from. So they are retrievable and inspectable, but NOT
+            # navigable: `navigate` to one of these ids would drive to the origin. That is a
+            # real limitation of the OWMM data, not an oversight here.
             embedding_worker.enqueue(
                 rgb        = rgb,
                 frame_path = str(img_path),
@@ -184,6 +241,9 @@ def _prepopulate_memory(ep_id: int, embedding_worker, episodic_memory):
                 robot_yaw  = 0.0,
             )
             entry = MemoryEntry(
+                # "sg_" prefix (not "mem_"): these are scene-graph images, not captured
+                # frames, and the distinct id space keeps them from colliding with the
+                # frame-index-derived ids the capture pipeline mints.
                 memory_id = f"sg_{ep_id}_{i}",
                 sensor    = SensorData(
                     image_path = str(img_path),
@@ -228,7 +288,13 @@ def _add_vlm_args(p):
 
 def _normalize_vlm_args(args):
     """When using the openai backend, swap the gemini default model for the
-    local default unless the user explicitly passed --vlm_model."""
+    local default unless the user explicitly passed --vlm_model.
+
+    Detecting "the user didn't pass one" by comparing against the Gemini default is a little
+    sly, but argparse offers no cleaner way to distinguish an unset flag from one explicitly
+    set to its default. The failure mode it prevents is real: --vlm_service openai with a
+    Gemini model name would be sent verbatim to the local server, which 404s.
+    """
     if getattr(args, "vlm_service", "gemini") == "openai" \
             and args.vlm_model == _GEMINI_DEFAULT_MODEL:
         args.vlm_model = _OPENAI_DEFAULT_MODEL
@@ -243,6 +309,12 @@ def _build_vlm_client(args, log_dir: str):
     gemini  → agent.gemini_client.GeminiClient (google.generativeai)
     openai  → agent.openai_client.OpenAIClient (OpenAI /v1/chat/completions,
               e.g. a locally-served Qwen at http://localhost:23333/v1)
+
+    ONE client serves both roles: it is the policy (the agent's decisions) AND the tool-internal
+    VLM (inspect / rerank). The banner spells that out because it surprises people — switching
+    to a local model swaps out the reasoning behind the tools too, not just the action choice.
+    (train/habitat_env_server.py deliberately separates them: there the policy is the model
+    under training while the tools keep a frozen VLM, so the environment doesn't drift.)
     """
     service = getattr(args, "vlm_service", "gemini")
     if service == "openai":
@@ -287,6 +359,20 @@ def _warm_protobuf_main_thread():
 # ── Per-episode runner ────────────────────────────────────────────────────────
 
 def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
+    """THE SHARED PIPELINE. One episode, end to end, for every Habitat-based runner.
+
+    Order of operations, and none of it is arbitrary:
+      1. clean the episode dir (stale index + fresh frames = memory_ids pointing at old images)
+      2. start the embedding worker and WAIT for it — its CUDA context must be created before
+         habitat-sim's EGL context, or the driver segfaults (see the comment inline)
+      3. build the Habitat env (needs cwd = the OWMM root for hydra)
+      4. build memory: pre-populate / frontier-explore / random scan — whichever the args ask
+      5. run PromptEmbodiedAgent to completion
+      6. collect Habitat's PDDL metrics as the objective score
+
+    Steps 1, 4 and the task text all go through the module-level hooks, which is what lets
+    run_ovmm_embodied.py reuse this wholesale.
+    """
     from agent.prompt_agent import PromptEmbodiedAgent
     from agent.episodic_memory import EpisodicMemory
     from memory.embedding import EmbeddingWorker
@@ -294,6 +380,8 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
 
     # task_prompt.json (test set) takes priority; for datasets without it
     # (train set) we derive the task from the PDDL episode after reset below.
+    # NOTE: bare `_task_prompt` — resolved through module globals at CALL time, so a runner
+    # that rebound it (run_ovmm_embodied) gets its own version here.
     task_text = args.task or _task_prompt(ep_id)
 
     log_dir     = Path(args.log_dir) / f"ep{ep_id:04d}"
@@ -392,6 +480,13 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
     )
 
     # ── Scene knowledge: frontier-explore / auto-scan / OWMM pre-coded images ──
+    # Three mutually exclusive ways to give the agent something to retrieve from, in
+    # descending order of how "earned" the knowledge is:
+    #   explore   — the robot actively maps the scene and drives to informative viewpoints
+    #   (default) — random navigable points, 4 yaws each; cheap, decent coverage
+    #   no_scan   — no exploration at all; use OWMM's 8 hand-picked images (the hook)
+    # All three end up in the same FAISS index + episodic memory, so the agent's `retrieve_memory`
+    # is identical regardless — only the CONTENT of its memory differs.
     if getattr(args, "explore", False):
         toolbox.explore_frontier(
             capture_dir      = str(capture_dir),
@@ -431,8 +526,10 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
     try:
         result = prompt_agent.run(task=task_text) or {}
     except KeyboardInterrupt:
-        raise
+        raise   # let the caller stop the whole sweep — this is the user, not a bug
     except Exception as exc:
+        # A crashed agent still gets metrics collected below, so it scores as a failed episode
+        # rather than disappearing from the results.
         print(f"[ep {ep_id}] agent error: {exc}", flush=True)
         traceback.print_exc()
         result = {"error": str(exc)}
@@ -440,11 +537,15 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
     elapsed = time.time() - t0
 
     # ── Metrics ───────────────────────────────────────────────────────────────
+    # THE OBJECTIVE SCORE. Habitat's own PDDL predicates decide success — not the agent's
+    # opinion of whether it finished. Read BEFORE the env is closed.
     try:
         hab_metrics = toolbox.get_metrics()
     except Exception:
         hab_metrics = {}
 
+    # Teardown order matters: the toolbox must flush its queued frames to disk before the
+    # embedding worker stops, and both before the env (which owns the sim) goes away.
     toolbox.close()          # flush live-memory frames captured during the task
     embedding_worker.stop()
     hab_env.close()
@@ -455,6 +556,8 @@ def _run_episode(ep_id: int, args, get_config, HabEnv) -> Dict[str, Any]:
         "elapsed_s"      : round(elapsed, 2),
         "framework"      : "embodied",
         "vlm_model"      : args.vlm_model,
+        # hab_ prefix namespaces Habitat's metrics away from our own fields. This is the
+        # prefix compare_results.py has to reconcile against OWMM's unprefixed names.
         **{f"hab_{k}": v for k, v in hab_metrics.items()},
     }
     (log_dir / "result.json").write_text(json.dumps(record, indent=2, default=str))

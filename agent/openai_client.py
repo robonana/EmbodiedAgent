@@ -28,6 +28,12 @@ from .gemini_client import GeminiClient
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var, accepting the usual truthy spellings.
+
+    Note the asymmetry: anything not in the truthy set (including "0", "false", and
+    typos) reads as False. That's intentional — these flags gate *extra* behaviour, so
+    an unrecognised value failing closed is the safe direction.
+    """
     val = os.environ.get(name)
     if val is None:
         return default
@@ -116,6 +122,13 @@ class OpenAIClient(GeminiClient):
 
     @staticmethod
     def _img_to_data_url(pil) -> str:
+        """Inline a PIL image as a base64 data URL for the OpenAI image_url block.
+
+        JPEG q=90 rather than PNG: base64 inflates the payload by ~33%, and a
+        multi-image rerank call carries a dozen frames — lossless PNG would make the
+        request several megabytes and dominate the round-trip time. q=90 is visually
+        indistinguishable for this purpose.
+        """
         buf = io.BytesIO()
         pil.convert("RGB").save(buf, format="JPEG", quality=90)
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -130,12 +143,18 @@ class OpenAIClient(GeminiClient):
         """
         from PIL import Image as _PIL
 
+        # By convention every caller in gemini_client.py builds parts as
+        # [system_or_instruction_text, ...rest], so parts[0] (if it's a string) is the
+        # system turn. Everything after it is the user turn.
         system_text: Optional[str] = None
         start = 0
         if parts and isinstance(parts[0], str):
             system_text = parts[0]
             start = 1
 
+        # One user message with an ordered content array. Order is load-bearing: the
+        # label text block must immediately precede the image it describes (see
+        # GeminiClient.call_policy) or the model can't tell the frames apart.
         content: list[dict] = []
         for part in parts[start:]:
             if isinstance(part, str):
@@ -157,6 +176,12 @@ class OpenAIClient(GeminiClient):
         return messages
 
     def _post(self, messages: list[dict]) -> str:
+        """POST one chat-completions request and return the (reasoning-stripped) content.
+
+        Raises on transport/HTTP errors — _call_with_retry is what decides whether to
+        retry, and it needs to distinguish a ConnectionError (tunnel down, wait longer)
+        from other failures.
+        """
         import requests
         payload = {
             "model": self.model_name,
@@ -187,6 +212,7 @@ class OpenAIClient(GeminiClient):
         )
         resp.raise_for_status()
         data = resp.json()
+        # Usage accounting is best-effort — some OpenAI-compatible servers omit it.
         try:
             um = data.get("usage", {})
             if um:
@@ -226,6 +252,12 @@ class OpenAIClient(GeminiClient):
         skip_print_first: bool = False,
         print_parts: bool = True,
     ) -> dict[str, Any]:
+        """Same retry/repair/degrade-to-{} contract as GeminiClient._call_with_retry.
+
+        Overridden purely to swap the transport (HTTP POST instead of the genai SDK) and
+        to give ConnectionError its own, longer backoff — the vLLM server usually sits at
+        the far end of an SSH tunnel that can drop and re-establish mid-episode.
+        """
         retries = max_retries if max_retries is not None else self.max_retries
         repair_parts = None
 
@@ -246,6 +278,9 @@ class OpenAIClient(GeminiClient):
             try:
                 active   = repair_parts if repair_parts else parts
                 messages = self._parts_to_messages(active)
+                # Blocking POST on a worker thread while we pump GUI events here, so the
+                # viewer stays responsive across a call that can take minutes with
+                # thinking enabled. Same pattern as GeminiClient.
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
                     _fut = _pool.submit(self._post, messages)
                     while not _fut.done():
@@ -255,14 +290,16 @@ class OpenAIClient(GeminiClient):
                             except Exception:
                                 pass
                         time.sleep(0.033)
-                    raw = _fut.result().strip()
+                    raw = _fut.result().strip()   # re-raises transport errors here
 
                 self._log_raw(raw, tag)
+                # _parse_json is inherited: same fence/<think>/<tool_call> stripping.
                 parsed = self._parse_json(raw)
                 if parsed is not None:
                     self._last_raw_response = raw
                     return parsed
 
+                # Unparseable: show the model its own output and ask for JSON only.
                 repair_parts = [
                     parts[0] if parts else "",
                     f"Your previous response was not valid JSON:\n{raw}\n\n"

@@ -5,6 +5,20 @@ The benchmark config uses kinematic scene objects for speed. This script snaps
 an object into the gripper, calls HabitatToolbox._release(), and measures
 whether the object falls. It also has a comparison scenario that manually marks
 the object dynamic before release.
+
+A CONTROLLED EXPERIMENT, and it is the experiment that justifies
+HabitatToolbox._enable_released_object_physics existing at all. Two scenarios, identical
+except for one line:
+
+    kinematic_release   release the object as the benchmark loads it (kinematic)
+    dynamic_release     mark it DYNAMIC first, then release
+
+The measurement is `drop_m` — how far the object's Y fell. If the kinematic scenario reports
+~0 and the dynamic one reports a real drop, the object was freezing in mid-air on release,
+and the toolbox is right to force it dynamic first. Both scenarios build a FRESH env, so
+neither can contaminate the other.
+
+Run it after touching anything in the release path.
 """
 
 from __future__ import annotations
@@ -33,10 +47,13 @@ def _save_rgb(path: Path, rgb) -> str | None:
 
 
 def _vec3(v) -> list[float]:
+    """magnum Vector3 → plain list, so it can go into the JSON summary."""
     return [float(v[0]), float(v[1]), float(v[2])]
 
 
 def _motion_name(obj) -> str:
+    """"MotionType.KINEMATIC" → "KINEMATIC". The whole point of the experiment is watching
+    this value, so record it in a readable form at every stage."""
     try:
         return str(obj.motion_type).split(".")[-1]
     except Exception:
@@ -44,6 +61,9 @@ def _motion_name(obj) -> str:
 
 
 def _make_dynamic(obj) -> None:
+    """The variable under test. Deliberately a trimmed copy of
+    HabitatToolbox._enable_released_object_physics — it omits the UserGroup7 collision-group
+    override, so this measures ONLY the effect of the motion-type change."""
     import habitat_sim
     import magnum as mn
 
@@ -51,7 +71,7 @@ def _make_dynamic(obj) -> None:
     obj.collidable = True
     obj.linear_velocity = mn.Vector3.zero_init()
     obj.angular_velocity = mn.Vector3.zero_init()
-    obj.awake = True
+    obj.awake = True   # a sleeping body ignores gravity entirely
 
 
 def _build_env(split: str, episode_id: int, gpu_id: int):
@@ -85,6 +105,15 @@ def _run_scenario(
     out_dir: Path,
     dynamic_before_release: bool,
 ) -> dict:
+    """Run one arm of the experiment and return everything measured.
+
+    Sequence: pose the arm → snap an object into the hand → record `before` → (optionally
+    make it dynamic) → release → step physics and sample the object's position over 3
+    seconds → record `final`. The headline number is drop_m in the returned dict.
+
+    A fresh env per scenario (built here, closed in the finally) is what keeps the two arms
+    independent.
+    """
     from sim.habitat_toolbox import HabitatToolbox
 
     env, obs = _build_env(split, episode_id, gpu_id)
@@ -112,14 +141,18 @@ def _run_scenario(
         obs = env.step(tb._null_step_action())
         tb._last_obs = obs
 
+        # force=True: snap the object into the hand regardless of contact. We are staging the
+        # release, not testing the grasp, so the approach is skipped entirely.
         obj_id = int(sim.scene_obj_ids[0])
         obj = rom.get_object_by_id(obj_id)
         handle = obj.handle
         sim.grasp_mgr.snap_to_obj(obj_id, force=True)
         obs = env.step(tb._null_step_action())
         tb._last_obs = obs
-        obj = rom.get_object_by_id(obj_id)
+        obj = rom.get_object_by_id(obj_id)   # re-fetch: the handle can be invalidated
 
+        # Baseline. `translation` here is what final translation is subtracted from to get
+        # drop_m, and `motion_type` records how the benchmark actually loaded the object.
         before = {
             "translation": _vec3(obj.translation),
             "motion_type": _motion_name(obj),
@@ -136,12 +169,15 @@ def _run_scenario(
             tb._capture_wrist_rgb(obs),
         )
 
+        # ── THE INDEPENDENT VARIABLE ──────────────────────────────────────────
         if dynamic_before_release:
             _make_dynamic(obj)
 
         release_ok, release_summary = tb._release()
         obs = tb._last_obs or env.step(tb._null_step_action())
         obj = rom.get_object_by_id(obj_id)
+        # Snapshot immediately after release, before any physics has run: snap_idx should now
+        # be None (the constraint is gone) while the object has not yet had time to move.
         after_release = {
             "translation": _vec3(obj.translation),
             "motion_type": _motion_name(obj),
@@ -149,6 +185,9 @@ def _run_scenario(
             "snap_idx": sim.grasp_mgr.snap_idx,
         }
 
+        # Drive physics by hand — the benchmark config disables automatic stepping, so
+        # nothing falls unless we tick it. 180 ticks at 1/60 s = 3 s of simulated time, ample
+        # for an object to fall from gripper height and settle.
         samples = []
         for i in range(180):
             sim.step_physics(1.0 / 60.0)
@@ -156,6 +195,8 @@ def _run_scenario(
                 sim.maybe_update_articulated_agent()
             except Exception:
                 pass
+            # Sample on a roughly logarithmic schedule: dense early (where the fall happens)
+            # and sparse later (confirming it has settled).
             if i in (0, 5, 15, 30, 60, 120, 179):
                 obj = rom.get_object_by_id(obj_id)
                 samples.append({
@@ -191,6 +232,8 @@ def _run_scenario(
             "after_release": after_release,
             "samples": samples,
             "final": final,
+            # THE RESULT. [1] is world Y (up in Habitat), so before - final is how far the
+            # object fell: ~0 means it froze in mid-air, a positive value means it dropped.
             "drop_m": before["translation"][1] - final["translation"][1],
             "paths": {
                 "before_head": str(scenario_dir / "before_head.png"),
@@ -214,6 +257,8 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # The two arms of the experiment. Compare their drop_m: if kinematic ≈ 0 and dynamic > 0,
+    # the motion-type conversion in _enable_released_object_physics is what makes release work.
     results = [
         _run_scenario(
             name="kinematic_release",

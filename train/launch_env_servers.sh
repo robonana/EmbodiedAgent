@@ -17,13 +17,17 @@
 #   RENDER_GPU=6 N_SERVERS=2 bash train/launch_env_servers.sh
 #
 # Stop them with:  tmux kill-session -t habenv
-set -euo pipefail
+set -euo pipefail   # fail fast; an unset var here means a silently misconfigured server
 
+# Every knob is ${VAR:-default}, so anything can be overridden from the environment
+# without editing this file. The positional $1 is a convenience alias for N_SERVERS.
 N_SERVERS=${1:-${N_SERVERS:-4}}
 RENDER_GPU=${RENDER_GPU:-7}               # keep disjoint from the trainer's GPUs
-BASE_PORT=${BASE_PORT:-8100}
+BASE_PORT=${BASE_PORT:-8100}              # servers listen on BASE_PORT .. BASE_PORT+N-1
 SPLIT=${SPLIT:-minival}
 MAX_STEPS=${MAX_STEPS:-16}
+# The HABITAT interpreter (3.9) — deliberately NOT the verl one. See the env server's
+# module docstring for why the two cannot share a Python.
 HAB_PY=${HAB_PY:-/data1/chen/conda/envs/habitat/bin/python}
 REPO=${REPO:-/data1/chen/EmbodiedAgent}
 LOG_DIR=${LOG_DIR:-$REPO/runs/rl_env/logs}
@@ -62,9 +66,13 @@ if [ -n "$VLM_PROXY" ]; then
 fi
 
 mkdir -p "$LOG_DIR"
+# tmux (rather than plain background jobs) so the servers survive the launching shell and
+# can be inspected live. Kill any previous session first — otherwise the old servers still
+# hold the ports and every new one dies on bind.
 tmux kill-session -t habenv 2>/dev/null || true
 tmux new-session -d -s habenv -n main "echo habenv; sleep infinity"
 
+# One tmux window per server, each on its own port.
 for i in $(seq 0 $((N_SERVERS - 1))); do
   port=$((BASE_PORT + i))
   log="$LOG_DIR/env_${port}.log"
@@ -86,6 +94,11 @@ for i in $(seq 0 $((N_SERVERS - 1))); do
        > $log 2>&1"
 done
 
+# Block until every server answers /health, so the caller can start training immediately
+# after this returns rather than racing a still-importing habitat-sim.
+# --noproxy '*' is essential: HTTPS_PROXY is exported above for the tool-VLM, and without
+# this curl would dutifully try to reach 127.0.0.1 *through the proxy* and fail.
+# 60 × 2 s = up to two minutes, which is about how long the first habitat import takes.
 echo "[launch] waiting for /health ..."
 for i in $(seq 0 $((N_SERVERS - 1))); do
   port=$((BASE_PORT + i))

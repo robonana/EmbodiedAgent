@@ -4,6 +4,17 @@
 Prints the arm camera params and computes the EE position expressed in the
 camera-link frame, so we can aim cam_look_at_pos / place cam_offset_pos directly
 at the gripper instead of guessing.
+
+This is the measurement that produced the magic numbers in
+HabitatToolbox._configure_gripper_camera. The camera mount is specified in the CAMERA-LINK
+frame, but everything one naturally knows about the gripper (where the fingers are, where the
+end-effector is) is in world coordinates. This script does the one transform that bridges
+them — world → camera-link — and prints the answer, so the mount can be set from a
+measurement rather than by trial and error.
+
+Its key finding, recorded in that method's comments: the two fingers separate along the
+camera-link Y axis, which is why a top-down camera sees only one finger and the mount instead
+looks ACROSS them along Z.
 """
 from __future__ import annotations
 import os, sys
@@ -32,8 +43,13 @@ def main():
     sim = env._sim
     robot = sim.agents_mgr[0].articulated_agent
     # Use the stretched reaching pose (operational pose), not the tucked init.
+    # This matters: the camera is rigid to the gripper link, so its view depends on where the
+    # arm IS. Measuring in the tucked pose would tune the camera for a configuration it is
+    # never actually used in. (The finger/EE offsets below come out the same either way —
+    # they are rigid to the same link — but this keeps the whole measurement honest.)
     robot.arm_joint_pos = [0.0, -0.30, 0.0, 0.30, 0.0, 0.80, 0.0]
-    robot.gripper_joint_pos = robot.params.gripper_open_state
+    robot.gripper_joint_pos = robot.params.gripper_open_state   # fingers apart, so their
+                                                                # separation axis is visible
     robot.update()
 
     cam = robot.params.cameras.get("articulated_agent_arm")
@@ -43,14 +59,18 @@ def main():
 
     # Find the gripper finger links and express them in the camera-link frame so
     # we know which axis the two fingers separate along.
+    #
+    # This is THE question. Both mount vectors are specified in this frame, so knowing that
+    # the fingers sit at roughly (0.08, ∓0.05, 0) tells us immediately that they separate
+    # along Y — and therefore that the camera must be offset along Z to see between them.
     link_T = robot.sim_obj.get_link_scene_node(cam.attached_link_id).transformation
-    inv = link_T.inverted()
+    inv = link_T.inverted()      # world → camera-link
     ao = robot.sim_obj
     for lid in ao.get_link_ids():
         try:
             nm = ao.get_link_name(lid)
         except Exception:
-            nm = ""
+            nm = ""   # unnamed link; the name filter below just won't match it
         if "finger" in str(nm).lower() or "gripper" in str(nm).lower():
             wpos = ao.get_link_scene_node(lid).transformation.translation
             local = inv.transform_point(wpos)
@@ -65,12 +85,16 @@ def main():
     # Camera link world transform
     link_id = cam.attached_link_id
     try:
+        # -1 is the convention for "attached to the base", which has no link node — its
+        # transform is the articulated object's own.
         if link_id == -1:
             link_T = robot.sim_obj.transformation
         else:
             link_T = robot.sim_obj.get_link_scene_node(link_id).transformation
         print("cam link world translation:", list(link_T.translation))
         # EE expressed in camera-link frame:
+        # The headline result — this vector IS the value to paste into cam_look_at_pos, and
+        # it comes out at roughly (0.08, 0, 0) for any arm pose (the EE is rigid to this link).
         ee_in_link = link_T.inverted().transform_point(ee_world)
         print(">>> EE in camera-link frame (aim cam_look_at_pos here):",
               [round(float(x), 4) for x in ee_in_link])

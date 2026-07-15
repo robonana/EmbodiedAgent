@@ -8,6 +8,15 @@ camera, steps once to re-render, and saves the wrist RGB to a PNG.
 
 Usage:
   python tools/tune_wrist_cam.py --split train --episode_id 0 --out runs/wrist_cam_tune
+
+The companion to tools/wrist_cam_diag.py. That script MEASURES the gripper geometry; this one
+SEARCHES over candidate mounts and renders each, so a human can pick the winner by looking.
+The mount that won ("s_up_r90") is the one now hard-coded in
+HabitatToolbox._configure_gripper_camera.
+
+Snapping an object into the gripper first is deliberate: an empty gripper is easy to frame,
+but the view only earns its keep if you can also see a HELD object between the fingers, which
+is what the agent needs it for.
 """
 from __future__ import annotations
 
@@ -25,35 +34,42 @@ if str(_REPO_ROOT) not in sys.path:
 
 
 # (label, cam_offset_pos, cam_look_at_pos, roll_deg)
-# Frame: +X→fingertips, ±Z→lateral side, Y→vertical. Current live setting is
-# offset(-0.06,0,-0.11) look_at(0.32,0,0.03) roll 90 — look_at aims far past the
-# gripper, so it only sees it partially. Candidates pull the look_at onto the
-# gripper and the camera in closer.
-# Measured: end-effector sits at (0.08, 0, 0) in the camera-link frame. Aim
-# cam_look_at_pos at/just past the EE and place the camera a short distance away.
-# EE is at (0.08,0,0) in cam-link frame for ALL arm poses (link rigid to gripper).
-# Move the camera FORWARD (+X, past the white arm housing → external mount) but
-# keep look_at ON the gripper (~0.09), not past it onto the floor.
-# Straight-DOWN top views: camera directly above the gripper (same X & Z as the
-# look_at, higher Y) so it looks straight down (-Y) and BOTH fingers are in the
-# image plane. roll rotates which way the finger-separation axis lies, so we
-# sweep roll to get the two fingers side-by-side rather than one behind the other.
-# Fingers separate along +Y (l at y=-0.04, r at y=+0.056), finger length along +X,
-# centered at ~(0.08, 0.008, 0). To see BOTH fingers + the gap, look along Z
-# (across the fingers). Level views are pure-side; elevated (+Y) ones angle down
-# for a "top-ish" feel while still showing both. roll swept to lay fingers
-# side-by-side. Look at the finger CENTER (0.08, 0.008, 0).
+#
+# All three values are in the CAMERA-LINK frame (rigid to the gripper):
+#     +X → out along the fingers      Y → vertical      ±Z → lateral
+#
+# Geometry, as measured by tools/wrist_cam_diag.py:
+#   · the end-effector sits at (0.08, 0, 0) — and does so for ANY arm pose, since the link
+#     is rigid to the gripper;
+#   · the two fingers sit at y = -0.04 and y = +0.056, i.e. they SEPARATE ALONG Y, with
+#     finger length running along +X. Their centre is ~(0.08, 0.008, 0).
+#
+# That Y-separation is the crux. A camera looking straight DOWN the Y axis (the obvious
+# "top-down" mount) sees the near finger occluding the far one — only one finger visible, and
+# no view of the gap between them. To see both fingers AND the gap, the camera must look
+# ACROSS them, i.e. be offset along Z.
+#
+# Hence every candidate below shares one look_at (the finger centre) and varies:
+#   · the offset — level (s_lvl_*, pure side view) vs elevated (+Y, s_up_*, angled slightly
+#     down for a more natural "over the gripper" feel while still seeing across the fingers);
+#   · roll — which rotates the finger-separation axis within the image, so the fingers appear
+#     side-by-side rather than stacked. This is what the roll sweep is for.
+#
+# The prior live setting was offset(-0.06,0,-0.11) look_at(0.32,0,0.03) roll 90, whose look_at
+# aimed far PAST the gripper (0.32 ≫ 0.08) and so framed it only partially. Every candidate
+# here pulls the look_at back onto the gripper itself.
 CANDIDATES = [
-    ("s_lvl_r0",  (0.08, 0.008, 0.11), (0.08, 0.008, 0.00),   0.0),
+    ("s_lvl_r0",  (0.08, 0.008, 0.11), (0.08, 0.008, 0.00),   0.0),   # side-on, level
     ("s_lvl_r90", (0.08, 0.008, 0.11), (0.08, 0.008, 0.00),  90.0),
-    ("s_up_r0",   (0.07, 0.09,  0.10), (0.08, 0.008, 0.00),   0.0),
-    ("s_up_r90",  (0.07, 0.09,  0.10), (0.08, 0.008, 0.00),  90.0),
+    ("s_up_r0",   (0.07, 0.09,  0.10), (0.08, 0.008, 0.00),   0.0),   # elevated, angled down
+    ("s_up_r90",  (0.07, 0.09,  0.10), (0.08, 0.008, 0.00),  90.0),   # ← the winner (shipped)
     ("s_up_rm90", (0.07, 0.09,  0.10), (0.08, 0.008, 0.00), -90.0),
-    ("s_up_close",(0.06, 0.07,  0.08), (0.08, 0.008, 0.00),  90.0),
+    ("s_up_close",(0.06, 0.07,  0.08), (0.08, 0.008, 0.00),  90.0),   # same, tighter crop
 ]
 
 
 def _build_env(split, episode_id, gpu_id):
+    """Build one OVMM episode via the real runner's config path (hydra needs the chdir)."""
     import run_ovmm_embodied as r
     r._load_taskmap(split)
     get_config, HabEnv = r.base._import_habitat()
@@ -108,23 +124,33 @@ def main():
     P1     = [0.0, -0.30, 0.0, 0.30, 0.0, 0.80, 0.0]   # reaching pose
 
     for label, off, look, roll in CANDIDATES:
-        # (1) tucked, then (2) configure/bake at tucked
+        # (1) tucked, then (2) configure/bake at tucked.
+        # The bake is why the order matters: habitat derives the camera's ORIENTATION from
+        # the offset/look_at pair *at the pose the robot is in when update() runs*, and then
+        # freezes it. Production configures the camera at the tucked pose, so tuning it at
+        # the reaching pose would bake a different orientation and the shipped mount would
+        # not match what we saw here.
         robot.arm_joint_pos = tucked
         robot.gripper_joint_pos = robot.params.gripper_open_state
         robot.update()
         cam.cam_offset_pos  = mn.Vector3(*off)
         cam.cam_look_at_pos = mn.Vector3(*look)
         cam.relative_transform = mn.Matrix4.rotation_z(mn.Deg(roll))
-        robot.update()
-        # (3) move to the reaching pose and (optionally) snap an object
+        robot.update()   # ← the bake
+        # (3) move to the reaching pose and (optionally) snap an object.
+        # Now we VIEW from the pose the camera is actually used in.
         robot.arm_joint_pos = P1
         robot.update()
-        obs = env.step(tb._null_step_action())
+        obs = env.step(tb._null_step_action())   # re-render at the new pose
+        # Put something in the hand: the mount has to show a held object, not just fingers.
+        # force=True snaps it in regardless of contact — we are staging a picture, not
+        # simulating a grasp.
         if sim.scene_obj_ids and not args.no_snap:
             try:
                 sim.grasp_mgr.snap_to_obj(int(sim.scene_obj_ids[0]), force=True)
                 obs = env.step(tb._null_step_action())
             except Exception as e:
+                # A failed snap still leaves a usable empty-gripper shot — keep going.
                 print(f"[tune] {label}: snap failed ({e})", flush=True)
         rgb = tb._capture_wrist_rgb(obs)
         if rgb is None:

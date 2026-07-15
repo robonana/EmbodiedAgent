@@ -58,6 +58,21 @@ from agent.schemas import ToolAction, ToolResult, VALID_TOOLS
 _SCAN_SNAPSHOT = "_post_scan"
 
 
+def _count_index_frames(index_dir) -> int:
+    """Number of frames in a FAISS index dir (0 if missing/empty/unreadable).
+
+    A frame_paths.json with N entries means the index holds N vectors — this is
+    the check that tells a good post-scan snapshot from a poisoned (empty) one.
+    """
+    try:
+        fp = Path(index_dir) / "frame_paths.json"
+        if not fp.exists():
+            return 0
+        return len(json.loads(fp.read_text()))
+    except Exception:
+        return 0
+
+
 # ── Observation encoding ──────────────────────────────────────────────────────
 
 def _encode_image(path: str, max_side: int) -> Optional[str]:
@@ -123,6 +138,13 @@ class _EpisodeSession:
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def _episode_args(self) -> SimpleNamespace:
+        """Fake the argparse Namespace the run_owmm_embodied helpers expect.
+
+        Those helpers were written for the CLI runner and read their configuration off an
+        args object. Rather than refactor them, we synthesise one — so the RL env and the
+        eval runner provably build the *same* env, toolbox and prompts, differing only in
+        who supplies the actions.
+        """
         c = self.cfg
         return SimpleNamespace(
             split=c.split,
@@ -179,7 +201,34 @@ class _EpisodeSession:
             os.chdir(prev_cwd)
         self.ep_id = ep_id
 
+    def _snapshot_valid(self, ep_id: int) -> bool:
+        """A snapshot is only usable if its FAISS index actually holds frames.
+
+        `first_build = not snapshot_dir.exists()` alone is a trap: a run that
+        crashes mid-scan (e.g. an OOM) can leave an empty _post_scan/index, and
+        because the directory then exists, the scan never re-runs — that episode's
+        memory is silently, permanently empty and every retrieve returns ~1 stale
+        frame. Requiring a non-empty index makes a poisoned snapshot self-heal.
+        """
+        p = self._paths(ep_id)
+        snap_index = p["snapshot"] / "index"
+        # Both files are required: the warm-start (EmbeddingWorker._load_existing_index)
+        # loads only when index.bin AND frame_paths.json are present, and the index
+        # must actually hold frames.
+        return (p["snapshot"].exists()
+                and (snap_index / "index.bin").exists()
+                and _count_index_frames(snap_index) > 0)
+
     def _paths(self, ep_id: int) -> Dict[str, Path]:
+        """All per-episode directories in one place.
+
+        `index` nests an extra str(ep_id) because BaseToolbox.retrieve_memory reconstructs
+        the index path as {retrieval_data_root}/{scene_id}/retrieval_index_{model}, and
+        scene_id is the episode id here. The two must agree or retrieval silently finds no
+        index.
+
+        `snapshot` holds the post-scan copy of memory+index — see _start_workers.
+        """
         work = Path(self.cfg.work_root) / f"ep{ep_id:04d}"
         capture_dir = work / "captures"
         return {
@@ -206,13 +255,22 @@ class _EpisodeSession:
         from memory.embedding import EmbeddingWorker
 
         p = self._paths(ep_id)
-        first_build = not p["snapshot"].exists()
+        first_build = not self._snapshot_valid(ep_id)
+        # Discard a poisoned (present-but-empty) snapshot so the first-build path
+        # re-scans and overwrites it cleanly.
+        if first_build and p["snapshot"].exists():
+            print(f"[env_server] ep{ep_id}: discarding invalid snapshot "
+                  f"(index frames={_count_index_frames(p['snapshot'] / 'index')})",
+                  flush=True)
+            shutil.rmtree(p["snapshot"], ignore_errors=True)
         if not first_build:
             for src, dst in ((p["snapshot"] / "memory", p["memory"]),
                              (p["snapshot"] / "index", p["index"])):
                 shutil.rmtree(dst, ignore_errors=True)
                 if src.exists():
                     shutil.copytree(src, dst)
+            print(f"[env_server] ep{ep_id}: restored scan memory "
+                  f"({_count_index_frames(p['index'])} frames)", flush=True)
         for key in ("capture", "index", "memory"):
             p[key].mkdir(parents=True, exist_ok=True)
 
@@ -220,6 +278,10 @@ class _EpisodeSession:
             index_dir=str(p["index"]), model_name=self.cfg.retrieval_model, device="auto")
         self.episodic_memory = EpisodicMemory(memory_dir=str(p["memory"]))
 
+        # Block until the extractor has loaded. This is the CUDA-context ordering
+        # constraint called out in reset(): the embedding model must finish claiming the
+        # GPU before habitat-sim creates its EGL context on this thread, or the driver
+        # segfaults. The 180 s bound is a safety valve, not an expectation.
         t0 = time.time()
         while not self.embedding_worker.is_ready and (time.time() - t0) < 180.0:
             time.sleep(0.1)
@@ -229,11 +291,15 @@ class _EpisodeSession:
         return first_build
 
     def _build_toolbox(self, ep_id: int, obs, first_build: bool) -> None:
+        """Construct the toolbox, and on a first build run (and snapshot) the scene scan."""
         from sim.habitat_toolbox import HabitatToolbox
 
         args = self._episode_args()
         p = self._paths(ep_id)
 
+        # Task text, in descending order of fidelity: the OVMM taskmap's own phrasing, then
+        # one derived from the episode's goal spec, then a generic fallback so a rollout can
+        # always proceed.
         self.task = base._task_prompt(ep_id) or ""
         if not self.task:
             try:
@@ -268,6 +334,18 @@ class _EpisodeSession:
             primary_camera=self.cfg.obs_camera,
         )
 
+        try:
+            n_scene = len(getattr(self.toolbox._sim, "scene_obj_ids", []))
+            print(f"[env_server] ep{ep_id}: {n_scene} pickable scene objects "
+                  f"(scene_obj_ids) — grasp can only target these", flush=True)
+        except Exception as exc:
+            print(f"[env_server] ep{ep_id}: scene_obj_ids check failed: {exc}", flush=True)
+
+        # The scan runs ONCE per episode, ever. Every subsequent rollout of this episode
+        # restores the snapshot instead — which is not just an optimisation: it guarantees
+        # all rollouts in a GRPO group start with byte-identical scene knowledge. If each
+        # rollout re-scanned (sampling random viewpoints), their advantages would partly
+        # reflect scan luck rather than policy quality.
         if first_build:
             self.toolbox.scan_scene(
                 n_points=args.scan_points,
@@ -276,12 +354,19 @@ class _EpisodeSession:
                 episodic_memory=self.episodic_memory,
                 episode_id=str(ep_id),
             )
+            scan_frames = _count_index_frames(p["index"])
             p["snapshot"].mkdir(parents=True, exist_ok=True)
             for src, dst in ((p["memory"], p["snapshot"] / "memory"),
                              (p["index"], p["snapshot"] / "index")):
                 shutil.rmtree(dst, ignore_errors=True)
                 if src.exists():
                     shutil.copytree(src, dst)
+            snap_frames = _count_index_frames(p["snapshot"] / "index")
+            print(f"[env_server] ep{ep_id}: scanned {scan_frames} frames, "
+                  f"snapshot saved ({snap_frames} frames)", flush=True)
+            if snap_frames == 0:
+                print(f"[env_server] WARNING ep{ep_id}: scan produced an empty "
+                      f"index — retrieval will be blind this episode", flush=True)
 
     def reset(self, ep_id: int) -> Dict[str, Any]:
         base._warm_protobuf_main_thread()
@@ -290,7 +375,10 @@ class _EpisodeSession:
         needs_sim = self.ep_id != ep_id or self.hab_env is None
         if needs_sim:
             self._close_sim()
-            if not self._paths(ep_id)["snapshot"].exists():
+            # Wipe the whole work dir when there is no *valid* snapshot to reuse, so
+            # a first build starts from a clean slate (a poisoned snapshot is treated
+            # as no snapshot — see _snapshot_valid).
+            if not self._snapshot_valid(ep_id):
                 shutil.rmtree(self._paths(ep_id)["work"], ignore_errors=True)
 
         # The embedding worker initialises a CUDA context on a background thread.
@@ -330,7 +418,18 @@ class _EpisodeSession:
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _observation(self) -> Dict[str, Any]:
-        """Render the exact prompt + images PromptEmbodiedAgent would show."""
+        """Render the exact prompt + images PromptEmbodiedAgent would show.
+
+        "Exact" is the requirement, not a nicety: the policy is trained on whatever this
+        returns, so any divergence from what the eval-time agent shows a model is a
+        train/serve skew that will quietly cost success rate. Hence build_policy_prompt is
+        called here rather than a training-specific prompt being written.
+
+        The one intentional difference is max_images_per_turn, which caps how many result
+        images are attached. Each image costs hundreds of tokens of context that is never
+        reclaimed across the whole multi-turn rollout, so training runs on a tighter image
+        budget than eval does.
+        """
         obs_result = self.toolbox.observe()
         if obs_result.ok:
             self.current_obs = dict(obs_result.data)
@@ -391,6 +490,15 @@ class _EpisodeSession:
     # ── Reward ───────────────────────────────────────────────────────────────
 
     def _terminal_reward(self) -> Tuple[float, Dict[str, Any]]:
+        """Score the finished episode from Habitat's own PDDL success predicate.
+
+        Two tiers, because full OVMM success (pick the right object AND place it at the
+        right receptacle) is rare enough early in training that a pure 0/1 reward gives
+        GRPO nothing to work with — every rollout in the group scores 0, the advantages are
+        all zero, and the gradient vanishes. Stage-1 credit (the object was picked up) is
+        awarded ONLY on failure, so it acts as a consolation signal that still ranks a
+        partial success above a total one.
+        """
         try:
             metrics = self.toolbox.get_metrics()
         except Exception:
@@ -405,10 +513,19 @@ class _EpisodeSession:
     # ── Step ─────────────────────────────────────────────────────────────────
 
     def step(self, action_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """One env step. Deliberately mirrors PromptEmbodiedAgent's loop body exactly.
+
+        Same degradation to `wait` on a bad action, same repeat detection, same terminal
+        conditions — the only difference is that a reward is computed. Keeping these in
+        lockstep is what makes the trained policy transferable to the eval runner.
+        """
         if self.done:
             raise RuntimeError("episode already finished; call /reset")
-        self.last_activity = time.time()
+        self.last_activity = time.time()   # refresh the idle lease
 
+        # Same two degradations as the agent loop: unparseable output and unknown tool both
+        # become a no-op `wait`. But here they also carry a reward penalty, so the policy
+        # has a gradient reason not to emit them.
         invalid = False
         if not action_dict or "tool" not in action_dict:
             invalid = True
@@ -421,10 +538,14 @@ class _EpisodeSession:
                 action = ToolAction(tool="wait", arguments={"seconds": 1},
                                     rationale=f"Tool {action.tool!r} is invalid.")
 
+        # Repeat detection, keyed on (tool, canonical args) — sort_keys so key order in the
+        # model's JSON doesn't make two identical actions look different.
         action_key = f"{action.tool}:{json.dumps(action.arguments, sort_keys=True, default=str)}"
         self.repeat_count = self.repeat_count + 1 if action_key == self.last_action_key else 0
         self.last_action_key = action_key
 
+        # Dense shaping (both default to ~0): a per-step cost to discourage dithering, plus
+        # an extra penalty for malformed output.
         reward = -self.cfg.step_penalty
         if invalid:
             reward -= self.cfg.invalid_penalty
@@ -432,6 +553,7 @@ class _EpisodeSession:
         done = False
         reason = ""
 
+        # Livelock guard — terminate rather than burn the remaining step budget.
         if self.repeat_count >= 10:
             result = ToolResult(ok=False, tool="finish",
                                 summary="Halted: repeated same action 10 times.")
@@ -460,10 +582,12 @@ class _EpisodeSession:
 
         metrics: Dict[str, Any] = {}
         if done:
+            # The terminal reward is where essentially all the signal lives.
             terminal, metrics = self._terminal_reward()
             reward += terminal
             self.done = True
             self.busy = False  # free the server for the next rollout
+                               # (so a well-behaved rollout never needs to call /release)
 
         payload = {
             "reward": reward,

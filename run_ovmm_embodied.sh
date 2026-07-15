@@ -21,6 +21,8 @@
 #   VLM_SERVICE=openai VLM_MODEL=Qwen3.5-9B \
 #       VLM_BASE_URL=http://localhost:23333/v1 bash run_ovmm_embodied.sh
 
+# Run from the repo root regardless of where the script was invoked from — every path below
+# (and the runner's own data/ lookups) is relative to it.
 cd "$(dirname "$0")"
 
 SPLIT=${SPLIT:-train}
@@ -28,18 +30,27 @@ EPISODES=${EPISODES:-0}
 
 # VLM backend selection (passed through to the runner, which also honours the
 # VLM_SERVICE / VLM_BASE_URL / VLM_API_KEY env vars directly).
+# Built as an ARRAY and expanded quoted ("${VLM_ARGS[@]}") so a value containing spaces
+# survives intact. Each flag is only added when its env var is non-empty, letting the runner's
+# own defaults apply otherwise — passing an empty --vlm_model would override them with "".
 VLM_ARGS=()
 if [ -n "$VLM_SERVICE" ];  then VLM_ARGS+=(--vlm_service "$VLM_SERVICE"); fi
 if [ -n "$VLM_BASE_URL" ]; then VLM_ARGS+=(--vlm_base_url "$VLM_BASE_URL"); fi
 if [ -n "$VLM_MODEL" ];    then VLM_ARGS+=(--vlm_model "$VLM_MODEL"); fi
 if [ -n "$VLM_API_KEY" ];  then VLM_ARGS+=(--vlm_api_key "$VLM_API_KEY"); fi
 
-# Prereq check: converted episodes must exist (see tools/convert_ovmm_episodes.py)
+# Prereq check: converted episodes must exist (see tools/convert_ovmm_episodes.py).
+# Auto-convert rather than erroring — it is a pure function of the downloaded dataset, so
+# there is never a reason to make the user run it by hand.
 if [ ! -f "data/datasets/ovmm/${SPLIT}.json.gz" ]; then
     echo "Converting OVMM '${SPLIT}' split first…"
     python tools/convert_ovmm_episodes.py "${SPLIT}"
 fi
 
+# -u: unbuffered, so the agent's reasoning streams to the terminal live rather than appearing
+# in bursts when the pipe buffer fills.
+# $EPISODES is intentionally UNQUOTED: it must word-split into several ids for --episode_ids.
+# ${@} forwards any extra flags the caller passed straight through to the runner.
 HABITAT_RENDER=${HABITAT_RENDER:-1} HABITAT_STEP=${HABITAT_STEP:-1} \
 python -u run_ovmm_embodied.py \
     --split "$SPLIT" \

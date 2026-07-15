@@ -18,6 +18,19 @@ Usage
 -----
     python -m sceneagent.run --scene_idx 3
     python -m sceneagent.run --scene_idx 3 --task "bring me the mug"
+
+The HUMAN-IN-THE-LOOP runner, and the only one where you build the agent's memory yourself:
+you drive the robot around with WASD, frames are captured and indexed as you go, and then you
+hand the agent a task and watch it use what you showed it. The other runners
+(run_habitat/run_ovmm/run_owmm) automate that scan and run headless.
+
+Two pygame HUD modes share one window — the scan HUD while you drive, and a minimal
+"agent running" HUD pumped by _event_callback from inside the agent's blocking calls. That
+callback is what keeps the window alive during a multi-second VLM request; see GeminiClient's
+event_pump.
+
+Query images (I / R) are the other distinctive feature: retrieve_memory can be queried with a
+PICTURE rather than text, so you can point the agent at an object by showing it one.
 """
 
 from __future__ import annotations
@@ -103,6 +116,8 @@ def main() -> None:
     root_pos      = sim["root_pos"]
 
     # ── Derive paths ───────────────────────────────────────────────────────────
+    # scene_id must match what BaseToolbox.retrieve_memory reconstructs from
+    # (retrieval_data_root, scene_id, retrieval_model), or retrieval finds no index.
     scene_id        = f"replicacad_{args.scene_idx:05d}_maniskill"
     capture_out_dir = os.path.join(args.retrieval_data_root, scene_id)
     index_dir       = os.path.join(
@@ -111,6 +126,9 @@ def main() -> None:
     )
 
     # ── Workers ────────────────────────────────────────────────────────────────
+    # Wipe ALL FOUR memory directories together. They are keyed by frame index, so a stale
+    # index alongside fresh frames would resolve memory_ids to images from a previous run —
+    # silently, and of a possibly different scene. Clearing them as a set is the invariant.
     import shutil
     memory_dir = os.path.join(capture_out_dir, "memory")
     for d in (os.path.join(capture_out_dir, "color"),
@@ -167,14 +185,23 @@ def main() -> None:
         return y + 18
 
     # ── Shared scan state ──────────────────────────────────────────────────────
+    # render_status / render_done are single-element LISTS, not plain values: the render
+    # callbacks below fire on a background thread and must mutate state the main loop reads.
+    # A bare `render_done = True` inside a nested function would rebind a local instead.
     task:          str | None       = args.task
     query_images:  list[str]        = []
     thumb_surf                      = None
-    last_capture_t: float           = -1e9
+    last_capture_t: float           = -1e9   # far past ⇒ capture on the first frame
     render_status: list[str]        = [""]
     render_done:   list[bool]       = [True]
 
     def _ask_string(title: str, prompt_text: str) -> str | None:
+        """Modal text prompt via tkinter (pygame has no text-input dialog).
+
+        A throwaway hidden root window per call — cheaper than keeping one alive, and it
+        avoids tkinter's event loop fighting pygame's. -topmost because the dialog otherwise
+        opens BEHIND the pygame window and looks like a hang.
+        """
         try:
             import tkinter as _tk
             from tkinter.simpledialog import askstring as _ask
@@ -184,6 +211,7 @@ def main() -> None:
             root.destroy()
             return result
         except Exception as e:
+            # No display / no tkinter — degrade to "no input" rather than crashing the sim.
             print(f"  [dialog] {e}")
             return None
 
@@ -205,10 +233,18 @@ def main() -> None:
             return []
 
     def _run_agent_episode(task_text: str, ref_images: list[str]) -> None:
+        """Assemble VLM + toolbox + agent and run one episode, then return to the scan loop.
+
+        Everything is rebuilt per episode (fresh log dir, fresh client, fresh toolbox) so
+        episodes are independent — but the MEMORY workers are the ones created in main() and
+        are deliberately shared, so the agent inherits everything you drove past, and anything
+        it sees during the episode is still there for the next one.
+        """
         ep_log_dir = os.path.join(
             args.agent_log_dir,
             f"scene{args.scene_idx:02d}_" + time.strftime("%Y%m%d_%H%M%S"),
         )
+        # event_pump: keeps the pygame window responsive during blocking VLM calls.
         gemini_client = GeminiClient(
             api_key    = args.gemini_api_key,
             model_name = args.vlm_model,
@@ -243,19 +279,32 @@ def main() -> None:
             history_window=args.agent_history_steps,
             max_monitor_cycles=args.max_monitor_cycles,
         )
+        # Catch everything: a failed episode must drop you back to the scan loop (where the
+        # scene and your memory are still intact), not kill the process.
         try:
             result = prompt_agent.run(task=task_text)
             print(f"\n[run] Episode result: {result}")
         except KeyboardInterrupt:
+            # Raised by _event_callback when you press Q mid-episode — a normal exit path.
             print("\n[run] Interrupted by user.")
         except Exception as exc:
             import traceback
             print(f"\n[run] Episode error: {exc}")
             traceback.print_exc()
 
-    _quit = [False]
+    _quit = [False]   # list, for the same mutate-from-nested-scope reason as above
 
     def _event_callback():
+        """Pumped from INSIDE the agent's blocking calls (VLM requests, control loops).
+
+        Without this the window would freeze for the entire episode and the OS would mark it
+        unresponsive. It does three things per call: drain the event queue, repaint a minimal
+        HUD, and re-render the sim.
+
+        The KeyboardInterrupt is how Q propagates out: there is no other way to interrupt code
+        several frames down inside the agent, so we raise through it and let _run_agent_episode
+        catch it as a clean abort.
+        """
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 _quit[0] = True
@@ -363,7 +412,10 @@ def main() -> None:
                             render_object_async(name, out_dir, _on_done, _on_err)
 
                 elif ev.key == pygame.K_n:
-                    # Determine task text
+                    # Determine task text.
+                    # Fallback chain: an explicit task wins; otherwise, if you supplied query
+                    # images, synthesise a generic task that refers to them (the images carry
+                    # the actual intent); otherwise ask.
                     run_task = task
                     if not run_task:
                         if query_images:
@@ -383,9 +435,13 @@ def main() -> None:
                         _run_agent_episode(run_task, list(query_images))
 
         # ── WASD driving + frame capture ───────────────────────────────────────
+        # get_pressed (not the KEYDOWN events above) so movement is CONTINUOUS while held,
+        # rather than one nudge per key repeat.
         keys = pygame.key.get_pressed()
         if any([keys[pygame.K_w], keys[pygame.K_s],
                 keys[pygame.K_a], keys[pygame.K_d]]):
+            # Kinematic, same as the agent's own base motion (see kinematic_nav_step):
+            # write qpos directly, no controller.
             qp  = agent.robot.get_qpos().cpu().numpy().flatten().copy()
             yaw = qp[2]
             if keys[pygame.K_w]:
@@ -394,6 +450,9 @@ def main() -> None:
             elif keys[pygame.K_s]:
                 qp[0] -= NAV_FWD_M_PER_STEP * math.cos(yaw)
                 qp[1] -= NAV_FWD_M_PER_STEP * math.sin(yaw)
+            # Separate `if` (not elif) from the W/S block, so you can drive and turn at once.
+            # ×2.5 because the per-step rotation tuned for the planner feels sluggish to a
+            # human hand.
             if keys[pygame.K_a]:
                 qp[2] += NAV_ROT_RAD_PER_STEP * 2.5
             elif keys[pygame.K_d]:
@@ -403,6 +462,13 @@ def main() -> None:
         obs, _, _, _, _ = env.step(np.zeros(action_shape, dtype=np.float32))
         env.render()
 
+        # ── This is where the agent's memory actually comes from ───────────────
+        # Every capture_interval seconds of driving, one frame fans out to the same three
+        # consumers the agent's own _bg_capture uses, keyed on a shared frame index:
+        #   capture_worker  → color/{idx}.png + robot_xy/{idx}.txt on disk
+        #   embedding_worker→ a vector in the FAISS index, under that same path
+        #   episodic_memory → the memory_id ⇄ pose ⇄ image record
+        # Tagged source_type="scan_wasd" to distinguish it from frames the agent captured.
         rgb = _capture_nav_frame(obs)
         if rgb is not None:
             now = time.time()
@@ -410,6 +476,7 @@ def main() -> None:
                 curr_xy  = get_robot_xy(agent, root_pos)
                 curr_yaw = get_robot_yaw(agent)
                 fidx     = capture_worker.enqueue(rgb, curr_xy, curr_yaw)
+                # Must match exactly what capture_worker will write — it is the join key.
                 fpath    = os.path.join(capture_out_dir, "color", f"{fidx:06d}.png")
                 embedding_worker.enqueue(rgb, fpath, curr_xy, curr_yaw)
                 last_capture_t = now
@@ -423,6 +490,8 @@ def main() -> None:
                 ))
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
+    # flush() before stop(): retrieval reads the PNGs back from disk, so queued frames must
+    # actually be written, not just indexed.
     if capture_worker is not None:
         capture_worker.flush()
     embedding_worker.stop()

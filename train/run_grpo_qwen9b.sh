@@ -2,9 +2,11 @@
 # train/run_grpo_qwen9b.sh — GRPO | Qwen3.5-9B | full fine-tune | multimodal | Habitat OVMM
 #
 # Prereqs, in order:
-#   1) bash train/launch_env_servers.sh 4          # env servers on GPU 0
-#   2) python train/prepare_habitat_dataset.py --split minival
+#   1) bash train/launch_env_servers.sh 4          # env servers on the render GPU
+#   2) python train/prepare_habitat_dataset.py --split train     # -> data/rl/train.parquet
+#      python train/prepare_habitat_dataset.py --split minival   # -> held-out val set
 #   3) bash train/run_grpo_qwen9b.sh
+# Trains on the TRAIN split, validates on minival. Override with TRAIN_FILES / VAL_FILES.
 #
 # The reward comes from the agent loop (AgentLoopOutput.reward_score, driven by
 # Habitat's pddl_success), so no reward model and no custom reward function are
@@ -78,6 +80,11 @@ rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.5}
 # One rollout == one simulated episode, so batches stay small on purpose.
 train_batch_size=${TRAIN_BATCH_SIZE:-8}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-8}
+
+# Train on the TRAIN split (37477 OVMM episodes), hold out minival for validation.
+# Do NOT train on minival — it is the eval set. (Both overridable.)
+train_files=${TRAIN_FILES:-$REPO/data/rl/train.parquet}
+val_files=${VAL_FILES:-$REPO/data/rl/minival.parquet}
 
 # An episode accumulates one observation image per turn and never drops it, so
 # the response, not the prompt, is where the context goes. See README.
@@ -191,12 +198,58 @@ else
   )
 fi
 
+# ── The verl invocation ───────────────────────────────────────────────────────
+# Hydra overrides for verl's PPO entrypoint. A leading `+` ADDS a key that is not in
+# verl's config schema; without it hydra rejects the override as unknown.
+#
+# Guide to the arg groups below (they are not otherwise annotatable — a comment cannot
+# be placed inside a backslash-continued command):
+#
+#   algorithm.*
+#     GRPO: advantages come from the reward spread within each group of `rollout.n`
+#     episodes sampled for the same task, so there is no value network to train.
+#     use_kl_in_reward=False together with actor.use_kl_loss=True puts the KL penalty in
+#     the LOSS rather than folding it into the reward — that split is GRPO's formulation.
+#
+#   data.*
+#     filter_overlong_prompts=False because our parquet `prompt` is a stub (the real
+#     prompt is rendered by the env server at rollout time), so there is nothing
+#     meaningful to length-filter. truncation='error' makes a genuine overflow loud
+#     instead of silently slicing a multimodal sequence — which corrupts image blocks.
+#
+#   actor_rollout_ref.model.*
+#     gradient checkpointing is what lets the 9B fit alongside long multimodal contexts.
+#     See the LoRA note above: lora_rank defaults to 0 (full fine-tune) on purpose.
+#
+#   actor_rollout_ref.actor.*
+#     kl_loss_type=low_var_kl is the k3 estimator — unbiased, and far lower variance than
+#     naive KL. Offload is off: there is headroom once the rollout is capped at 0.5.
+#
+#   actor_rollout_ref.rollout.*
+#     mode=async is REQUIRED for a custom agent loop — the loop awaits HTTP round-trips to
+#     the env server between turns, which the sync path cannot express.
+#     n = the GRPO group size.
+#     free_cache_engine returns vLLM's KV cache to FSDP between rollout and training.
+#     limit_images and gdn_prefill_backend are both load-bearing bug workarounds; see the
+#     long notes above before touching either.
+#     agent.* is what wires in HabitatAgentLoop and makes the rollout embodied at all.
+#
+#   actor_rollout_ref.ref.*
+#     The frozen KL anchor. Offloaded because it only ever produces log-probs — no grads.
+#
+#   reward_model.enable=False
+#     There is no reward model. Reward is AgentLoopOutput.reward_score, which the env
+#     server computes from Habitat's PDDL success predicate.
+#
+#   trainer.test_freq=-1
+#     Disables periodic validation: a val pass runs real Habitat episodes and is slow.
+#     Run it deliberately instead.
 $VERL_PY -m verl.trainer.main_ppo \
     "${BSZ_ARGS[@]}" \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    data.train_files="$REPO/data/rl/minival.parquet" \
-    data.val_files="$REPO/data/rl/minival.parquet" \
+    data.train_files="$train_files" \
+    data.val_files="$val_files" \
     data.train_batch_size=${train_batch_size} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \

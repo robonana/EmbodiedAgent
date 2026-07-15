@@ -6,6 +6,15 @@ Run from the repo root:
 
 Tests do NOT require ManiSkill, SAPIEN, or Gemini API.
 Tests 1-4 are fully offline.  Test 5 requires --real_gemini flag + API key.
+
+The offline constraint drives the whole design here. Booting Habitat takes tens of
+seconds and needs a GPU, and calling Gemini costs money and is non-deterministic, so
+neither may appear in the default suite. Instead we test the parts that are pure logic —
+JSON coercion, schema round-trips, argument validation, the agent's control flow (via a
+mock VLM that returns a scripted action sequence), and the on-disk memory/logging stores.
+
+Imports are inside each test method rather than at module level so that a broken or
+missing optional dependency in one module cannot prevent the entire suite from loading.
 """
 
 from __future__ import annotations
@@ -23,7 +32,16 @@ from unittest.mock import MagicMock, patch
 # ── Test 1: JSON parsing ──────────────────────────────────────────────────────
 
 class TestJSONParsing(unittest.TestCase):
-    """GeminiClient._parse_json handles valid, fenced, and invalid inputs."""
+    """GeminiClient._parse_json handles valid, fenced, and invalid inputs.
+
+    One case per wrapping the model has actually been observed to produce. The two
+    negative cases matter as much as the positive ones: _parse_json must return None
+    (triggering the repair-prompt retry) rather than raising or silently returning
+    something half-parsed.
+
+    _parse_json is a staticmethod, so these run without constructing a client — no API key,
+    no network.
+    """
 
     def _parse(self, text: str):
         from sceneagent.agent.gemini_client import GeminiClient
@@ -48,6 +66,7 @@ class TestJSONParsing(unittest.TestCase):
         self.assertEqual(result["tool"], "finish")
 
     def test_json_embedded_in_prose(self):
+        # Exercises the brace-matching fallback: the model chatted around its JSON.
         raw = 'Here is my action:\n{"tool": "inspect", "arguments": {"question": "test"}}\nDone.'
         result = self._parse(raw)
         self.assertIsNotNone(result)
@@ -59,6 +78,8 @@ class TestJSONParsing(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_partial_json_returns_none(self):
+        # Truncated output (hit the token cap mid-object). Brace matching must not
+        # "helpfully" close it — an incomplete action is worse than no action.
         raw = '{"tool": "observe", "arguments":'
         result = self._parse(raw)
         self.assertIsNone(result)
@@ -122,8 +143,18 @@ class TestSchemas(unittest.TestCase):
 # ── Test 3: Verifier ──────────────────────────────────────────────────────────
 
 class TestVerifier(unittest.TestCase):
+    """check_tool_argument_validity — the gate between VLM output and the simulator.
+
+    Two families of test here:
+      * Tools that USED to exist and must now be rejected (observe/verify/approach). The
+        model, trained on or prompted with older tool lists, still tries to call them;
+        these tests pin the rejection so a regression can't silently re-admit them.
+      * Argument-shape checks per tool, especially the bbox forms, where a malformed box
+        would otherwise reach PIL and crop garbage.
+    """
 
     def test_check_tool_argument_validity_observe_is_invalid(self):
+        # observe() is called by the agent loop, not by the VLM — it is not in VALID_TOOLS.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity("observe", {})
         self.assertFalse(valid)
@@ -142,12 +173,17 @@ class TestVerifier(unittest.TestCase):
         self.assertEqual(reason, "invalid_arguments")
 
     def test_navigate_no_pose_rejected(self):
+        # Empty target dict — no memory_id under any of its accepted key names.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity(
             "navigate", {"target": {}})
         self.assertFalse(valid)
         self.assertEqual(reason, "invalid_arguments")
 
+    # STALE: this test predates the "memory_id only" restriction on navigate. The verifier
+    # now deliberately REJECTS raw coordinate/pose goals (see the comment in
+    # verifier.check_tool_argument_validity), so this assertion no longer matches the
+    # intended behaviour and will fail. It should be inverted to assertFalse, or deleted.
     def test_navigate_pose_accepted(self):
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, _ = check_tool_argument_validity(
@@ -156,6 +192,7 @@ class TestVerifier(unittest.TestCase):
         self.assertTrue(valid)
 
     def test_navigate_memory_id_accepted(self):
+        # The one accepted form.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, _ = check_tool_argument_validity(
             "navigate",
@@ -163,6 +200,8 @@ class TestVerifier(unittest.TestCase):
         self.assertTrue(valid)
 
     def test_unsupported_skill(self):
+        # A coherent-but-unimplemented skill gets its own reason code, distinct from
+        # "invalid_arguments", so the model is told *why* it can't wipe the board.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity(
             "manipulate", {"skill": "wipe", "target": "board"})
@@ -204,11 +243,14 @@ class TestVerifier(unittest.TestCase):
         self.assertEqual(reason, "invalid_arguments")
 
     def test_inspect_bad_bbox(self):
+        # Single flat box with only 2 coords — must be 4.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, _ = check_tool_argument_validity("inspect", {"bbox": [10, 20], "question": "?", "image_path": "/tmp/x.png"})
         self.assertFalse(valid)
 
     def test_inspect_multi_bbox_valid(self):
+        # The list-of-boxes form, which the verifier distinguishes from a single flat box
+        # by looking at whether bbox[0] is a number.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity(
             "inspect",
@@ -218,6 +260,8 @@ class TestVerifier(unittest.TestCase):
         self.assertIsNone(reason)
 
     def test_inspect_multi_bbox_bad_inner(self):
+        # Every box must be well-formed — one bad box invalidates the call, rather than
+        # being silently dropped while the others proceed.
         from sceneagent.agent.verifier import check_tool_argument_validity
         valid, reason = check_tool_argument_validity(
             "inspect",
@@ -230,9 +274,18 @@ class TestVerifier(unittest.TestCase):
 # ── Test 4: Prompt loop dry-run with mock Gemini ──────────────────────────────
 
 class TestPromptLoopMock(unittest.TestCase):
-    """Run a short 5-step episode with a deterministic mock Gemini client."""
+    """Run a short 5-step episode with a deterministic mock Gemini client.
+
+    The closest thing to an end-to-end test that stays offline. Both ends of the agent are
+    replaced by mocks — a toolbox that says "ok" to everything, and a VLM that returns a
+    scripted list of actions — leaving the real PromptEmbodiedAgent control flow in the
+    middle as the thing under test: does it step, log, terminate on finish, and halt on a
+    repeat loop?
+    """
 
     def _make_mock_sequence(self) -> list[dict]:
+        # A plausible episode arc — search memory, go there, close the gap, declare done —
+        # so the loop is exercised across four different tool types, not just one.
         return [
             {"tool": "retrieve_memory", "arguments": {"query": "water bottle", "top_k": 3},
              "previous_action_verification": "Previous action verification: no previous action yet.",
@@ -254,6 +307,7 @@ class TestPromptLoopMock(unittest.TestCase):
         ]
 
     def test_dry_run(self):
+        """Happy path: the loop runs the scripted actions, terminates, and writes a log."""
         # Build a minimal mock toolbox that returns ok=True for everything
         mock_toolbox = MagicMock()
 
@@ -276,7 +330,9 @@ class TestPromptLoopMock(unittest.TestCase):
         mock_toolbox.observe.return_value = _mock_execute(
             MagicMock(tool="wait", arguments={"seconds": 0}))
 
-        # Mock GeminiClient
+        # Mock GeminiClient: walk the scripted sequence, one action per call. The list in
+        # `call_idx` is a mutable cell — the closure needs to mutate the counter, and this
+        # predates/avoids `nonlocal`.
         sequence = self._make_mock_sequence()
         call_idx = [0]
 
@@ -286,11 +342,13 @@ class TestPromptLoopMock(unittest.TestCase):
             call_idx[0] += 1
             if idx < len(sequence):
                 return sequence[idx]
+            # Backstop: if the loop somehow asks for more actions than the script has,
+            # finish rather than running to max_steps and slowing the suite down.
             return {"tool": "finish", "arguments": {}, "rationale": "done",
                     "expected_progress": "end"}
 
         mock_gemini.call_policy.side_effect = _mock_policy
-        mock_gemini.model_name = "mock-model"
+        mock_gemini.model_name = "mock-model"   # the loop reads this for logging
 
         with tempfile.TemporaryDirectory() as tmpdir:
             from sceneagent.agent.prompt_agent import PromptEmbodiedAgent
@@ -308,6 +366,7 @@ class TestPromptLoopMock(unittest.TestCase):
             self.assertIn("episode_dir", result)
             self.assertGreater(result["total_steps"], 0)
             # Verify trajectory JSONL was written (check while tmpdir still exists)
+            # — the assertions must happen inside the `with`, or the directory is gone.
             import glob
             jsonl_files = glob.glob(
                 os.path.join(result["episode_dir"], "trajectory.jsonl"))
@@ -320,7 +379,13 @@ class TestPromptLoopMock(unittest.TestCase):
             self.assertIn("action", first_step)
 
     def test_repeat_action_halts(self):
-        """Same action 5× should trigger halt before max_steps."""
+        """Same action 5× should trigger halt before max_steps.
+
+        The anti-livelock guard. A VLM that gets stuck will happily emit the same action
+        until the step budget runs out, burning API calls on a wedged state. Here the mock
+        always returns the same `wait`, and we assert the loop cuts it short: the halt fires
+        at 10 consecutive repeats (~11 steps), well under max_agent_steps=20.
+        """
         mock_toolbox = MagicMock()
 
         def _ok_result(action):
@@ -494,6 +559,16 @@ class TestEpisodicMemory(unittest.TestCase):
             self.assertIsNone(mem.get_pose("mem_999999"))
 
     def test_memory_id_navigation_prefers_robot_xy_file(self):
+        """_pose_from_memory_id must prefer the on-disk scan pose over EpisodicMemory.
+
+        The two sources are seeded with *deliberately different* values here (the entry's
+        robot_pose has y and yaw scrambled relative to the file), so the assertions can only
+        pass if the file won. That precedence matters: the robot_xy sidecar is the
+        authoritative pose recorded at capture time.
+
+        DummyToolbox exists solely to make BaseToolbox instantiable — every abstract
+        primitive is stubbed, because this test touches none of them.
+        """
         from sceneagent.agent.episodic_memory import EpisodicMemory
         from sceneagent.agent.toolbox_base import BaseToolbox
 
@@ -534,7 +609,11 @@ class TestEpisodicMemory(unittest.TestCase):
             self.assertAlmostEqual(float(yaw), 0.0125347)
 
     def test_index_persists(self):
-        """Index survives reload from disk."""
+        """Index survives reload from disk.
+
+        Opening a second EpisodicMemory on the same directory simulates a fresh process:
+        it must rebuild its id→line map from memory_index.json and still resolve entries.
+        """
         from sceneagent.agent.episodic_memory import EpisodicMemory
         with tempfile.TemporaryDirectory() as tmpdir:
             mem = EpisodicMemory(memory_dir=tmpdir)
@@ -564,6 +643,8 @@ class TestEpisodicMemory(unittest.TestCase):
             ]
             mem.enrich_candidates(candidates)
 
+            # The known id gets its timestamp joined in; the unknown one is left alone
+            # rather than failing the whole enrichment pass.
             self.assertEqual(candidates[0].timestamp, "10:00:00")
             self.assertIsNone(candidates[1].timestamp)
 
@@ -593,6 +674,9 @@ class TestEpisodicMemory(unittest.TestCase):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Hand-rolled runner rather than plain `unittest.main()`, so that the one test which
+    # costs money and needs the network (the live Gemini call) is opt-in behind a flag and
+    # never runs by accident in CI or during a routine `python -m ...` invocation.
     import argparse
 
     ap = argparse.ArgumentParser(description="Agent pipeline smoke tests")
@@ -621,6 +705,9 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 
+    # Opt-in live test: confirms the API key works and that a real round-trip comes back as
+    # parseable JSON. Kept outside the suite (and its failures kept out of the exit code)
+    # because a network blip should not turn the offline suite red.
     if test_args.real_gemini:
         key = test_args.api_key or os.environ.get("GOOGLE_API_KEY", "")
         if not key:

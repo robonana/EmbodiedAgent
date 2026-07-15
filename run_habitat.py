@@ -25,6 +25,15 @@ Usage
     # override dataset path:
     python run_habitat.py \\
         --dataset data/datasets/replica_cad/single_agent_eval.json.gz
+
+The plain Habitat runner: no benchmark harness, no pre-collected scene images, just "load a
+ReplicaCAD rearrange episode and let the agent at it". The benchmark runners
+(run_owmm_embodied / run_ovmm_embodied) supersede it for evaluation, but two of its functions
+are imported by them and are the reason it still matters:
+
+    _derive_task_text()          builds a task SENTENCE from a PDDL episode spec — the
+                                 fallback used whenever a dataset ships no task_prompt.json
+    _add_third_person_sensor()   injects the over-the-shoulder camera used for rendering/video
 """
 
 from __future__ import annotations
@@ -88,6 +97,14 @@ def _derive_task_text(episode) -> str:
 
     Uses episode.targets (object → goal transform) and episode.name_to_receptacle
     (object → receptacle).  Falls back to a generic pick-and-place description.
+
+    The LAST-RESORT task source across the whole project — every runner calls this when its
+    dataset has no authored task sentence. It reverse-engineers prose from the episode's
+    structural spec, which is why the output reads a little stilted ("on/in the"): the spec
+    says *what* must end up *where*, not how a person would phrase it.
+
+    Every field is fetched with getattr(..., default) because RearrangeEpisode's shape varies
+    across dataset versions and a missing attribute must degrade the sentence, not raise.
     """
     targets          = getattr(episode, "targets",          {}) or {}
     name_to_recep    = getattr(episode, "name_to_receptacle", {}) or {}
@@ -96,9 +113,11 @@ def _derive_task_text(episode) -> str:
     if not targets:
         return "Pick up the object and place it at the goal location."
 
+    # One sentence per target — multi-object episodes exist, though they are rare.
     parts = []
     for obj_key in targets:
         # obj_key is typically "handle:index", e.g. "kitchen_counter_01:0000"
+        # Strip the instance index and de-snake_case it into something readable.
         obj_name = obj_key.split(":")[0].replace("_", " ").strip()
         recep    = name_to_recep.get(obj_key, "")
         goal_loc = (
@@ -106,6 +125,8 @@ def _derive_task_text(episode) -> str:
             if goal_receptacles
             else "the goal location"
         )
+        # Naming the SOURCE receptacle when we know it makes the task far easier to ground —
+        # "from the kitchen counter" tells the agent where to look first.
         if recep:
             src = recep.replace("_", " ").strip()
             parts.append(
@@ -155,7 +176,17 @@ def _build_hab_config(args, get_config):
 
 
 def _add_third_person_sensor(cfg) -> None:
-    """Inject a third-person tracking camera into an already-loaded Habitat config."""
+    """Inject a third-person tracking camera into an already-loaded Habitat config.
+
+    Imported and used by BOTH benchmark runners — this is the over-the-shoulder view the
+    pygame window and the recorded videos show. Added at runtime rather than in the YAML so it
+    only costs a render pass when someone is actually watching.
+
+    The OmegaConf dance is the interesting part: a loaded Habitat config is STRUCT-mode
+    (unknown keys rejected) and READONLY (no mutation). Both flags have to be lifted on the
+    config *and* on the nested sensors node before a new key can be inserted, then struct mode
+    is restored so the rest of the program still gets typo protection.
+    """
     from habitat.config.default_structured_configs import HabitatSimRGBSensorConfig
     from omegaconf import OmegaConf
 
@@ -163,19 +194,21 @@ def _add_third_person_sensor(cfg) -> None:
         uuid="third_person_sensor",
         width=640, height=480, hfov=90,
         # 2 m above + 2 m behind the robot root; pitched ~25° down (yaw π = face forward).
+        # The camera is a CHILD of the robot's root node, so it tracks the robot automatically —
+        # these are offsets in the robot's frame, not world coordinates.
         position=[0.0, 2.0, 2.0],
         orientation=[-0.45, 3.14159, 0.0],
-        noise_model="None",
+        noise_model="None",       # clean image: this is for humans, not for the agent
         noise_model_kwargs={},
     )
-    agent_key = list(cfg.habitat.simulator.agents.keys())[0]
+    agent_key = list(cfg.habitat.simulator.agents.keys())[0]   # single-agent setup
     sensors_node = cfg.habitat.simulator.agents[agent_key].sim_sensors
     OmegaConf.set_struct(cfg, False)
     OmegaConf.set_readonly(cfg, False)
     OmegaConf.set_struct(sensors_node, False)
     OmegaConf.set_readonly(sensors_node, False)
     sensors_node["third_person_sensor"] = OmegaConf.structured(sensor)
-    OmegaConf.set_struct(cfg, True)
+    OmegaConf.set_struct(cfg, True)    # re-lock; readonly is intentionally left off
     print("[run_habitat] third-person sensor added to config")
 
 
@@ -212,6 +245,8 @@ def _run_episode(
 
     scene_id = getattr(episode, "scene_id", f"ep{episode_idx}")
 
+    # event_pump=None: this runner is headless (no pygame window to keep alive during the
+    # blocking VLM call). run.py passes one.
     gemini_client = GeminiClient(
         api_key    = args.gemini_api_key,
         model_name = args.vlm_model,
@@ -219,6 +254,10 @@ def _run_episode(
         event_pump = None,
     )
 
+    # NOTE no embedding_worker / episodic_memory / grounding_dino here — unlike the benchmark
+    # runners, this one gives the agent NO retrieval stack and NO detector. `retrieve_memory`
+    # will report no index and `detect` is unavailable, so the agent works from the live camera
+    # and `inspect` alone. That is the deliberate baseline this script measures.
     toolbox = HabitatToolbox(
         hab_env        = hab_env,
         gemini_client  = gemini_client,
@@ -251,7 +290,8 @@ def _run_episode(
 
     elapsed = time.time() - t0
 
-    # Habitat metrics
+    # Habitat metrics — the objective verdict (PDDL predicates), not the agent's own opinion
+    # of whether it finished. Read before teardown.
     try:
         hab_metrics = toolbox.get_metrics()
     except Exception:
@@ -263,7 +303,9 @@ def _run_episode(
         "scene_id"      : scene_id,
         "task"          : task_text,
         "elapsed_s"     : round(elapsed, 2),
-        "agent_result"  : result,
+        "agent_result"  : result,        # what the AGENT thought happened
+        # hab_-prefixed: what HABITAT says happened. Keeping the two namespaces separate is
+        # what makes it possible to compare the agent's self-assessment against ground truth.
         **{f"hab_{k}": v for k, v in hab_metrics.items()},
     }
 

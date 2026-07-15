@@ -6,8 +6,11 @@
 # `env_server_urls` must list one running train/habitat_env_server.py per entry;
 # each server drives exactly one episode at a time, so the list length is the
 # rollout concurrency for this trainer process. HABITAT_ENV_SERVERS overrides it.
-- name: habitat
-  _target_: train.habitat_agent_loop.HabitatAgentLoop
+- name: habitat                                        # matches @register("habitat")
+  _target_: train.habitat_agent_loop.HabitatAgentLoop  # hydra instantiates this class
+  # One URL per running env server, started by train/launch_env_servers.sh. Keep this in
+  # sync with N_SERVERS there — the agent loop acquires a server by trying /reset across
+  # the list, so extra URLs mean timeouts and too few mean rollouts queue up waiting.
   env_server_urls:
     - http://127.0.0.1:8100
     - http://127.0.0.1:8101
