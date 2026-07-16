@@ -255,14 +255,26 @@ class HabitatAgentLoop(AgentLoopBase):
         deadline = asyncio.get_event_loop().time() + self.acquire_timeout
         while asyncio.get_event_loop().time() < deadline:
             for url in urls:
-                async with session.post(f"{url}/reset",
-                                        json={"episode_id": episode_id}) as resp:
-                    if resp.status == 409:      # busy, try the next one
-                        continue
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"{url}/reset -> HTTP {resp.status}: {await resp.text()}")
-                    return url, await resp.json()
+                # A server saturated by the rollout stampede (rollout.n * batch
+                # connections hitting len(urls) servers) can RST the socket rather
+                # than return a clean 409 — the client sees ClientOSError/[Errno 104]
+                # or a read timeout. That is NOT fatal: it means "not now, try
+                # again", exactly like a 409. Swallow connection-level errors and
+                # keep polling; only a real HTTP error status is worth crashing on.
+                # (An RST after the server already flipped busy=True orphans that
+                # server, but its idle lease reclaims it well before acquire_timeout.)
+                try:
+                    async with session.post(f"{url}/reset",
+                                            json={"episode_id": episode_id}) as resp:
+                        if resp.status == 409:      # busy, try the next one
+                            continue
+                        if resp.status != 200:
+                            raise RuntimeError(
+                                f"{url}/reset -> HTTP {resp.status}: {await resp.text()}")
+                        return url, await resp.json()
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    logger.debug("acquire %s transient error, retrying: %s", url, exc)
+                    continue
             await asyncio.sleep(self.acquire_poll_s)
         raise RuntimeError(
             f"no free Habitat env server after {self.acquire_timeout}s "
